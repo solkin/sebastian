@@ -1,0 +1,8 @@
+sebastiand
+*.db
+*.db-wal
+*.db-shm
+*.out
+.DS_Store
+.idea
+.vscode
