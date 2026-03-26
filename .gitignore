@@ -1,4 +1,4 @@
-sebastiand
+/sebastiand
 *.db
 *.db-wal
 *.db-shm
