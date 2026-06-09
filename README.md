@@ -127,6 +127,20 @@ root_dir/
   documents/     ← bucket "documents"
 ```
 
+## S3 Authentication
+
+When `access_key`/`secret_key` are set, requests must be signed with AWS Signature
+Version 4 — either via the `Authorization` header or presigned query parameters.
+Any S3 SDK or tool configured with the same credentials works out of the box.
+
+- Legacy Signature V2 (`AWS key:signature`) is not supported.
+- Presigned URLs are validated against their `X-Amz-Expires` window.
+- The request body is not re-hashed: the signature authenticates the caller, but
+  payload integrity is not independently verified and `aws-chunked` streaming
+  bodies are not decoded. Run behind TLS for transport security.
+
+Leaving both keys empty disables authentication (all requests are allowed).
+
 ## Building
 
 ```bash

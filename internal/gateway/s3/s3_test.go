@@ -49,9 +49,11 @@ func authHeaders(accessKey string) map[string]string {
 	}
 }
 
-// sigV4Headers returns headers for authenticated requests using V4 format.
+// sigV4Headers returns a structurally valid V4 header carrying a bogus signature.
+// Used to verify that a well-formed request with an incorrect signature is rejected.
 func sigV4Headers(accessKey string) map[string]string {
 	return map[string]string{
+		"X-Amz-Date":    "20260206T163218Z",
 		"Authorization": fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/20260206/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123", accessKey),
 	}
 }
@@ -73,21 +75,35 @@ func TestAuth_NoAuthConfigured(t *testing.T) {
 	}
 }
 
-func TestAuth_ValidV2(t *testing.T) {
+func TestAuth_V2Rejected(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 
+	// Legacy SigV2 ("AWS key:signature") is no longer accepted.
 	w := serveRequest(g, http.MethodGet, "/", nil, authHeaders("admin"))
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for SigV2, got %d", w.Code)
 	}
 }
 
 func TestAuth_ValidV4(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 
-	w := serveRequest(g, http.MethodGet, "/", nil, sigV4Headers("admin"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	signV4Header(req, "admin", "secret")
+	w := httptest.NewRecorder()
+	g.route(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuth_V4BadSignature(t *testing.T) {
+	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+
+	// Correct structure and access key but an incorrect signature must be rejected.
+	w := serveRequest(g, http.MethodGet, "/", nil, sigV4Headers("admin"))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for bad signature, got %d", w.Code)
 	}
 }
 
@@ -113,7 +129,7 @@ func TestAuth_PresignedURL_Valid(t *testing.T) {
 	g, syncDir := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
 
-	url := "/mybucket/file.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin%2F20260206%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260206T163218Z&X-Amz-Expires=2999&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=abcdef1234567890"
+	url := presignV4(http.MethodPut, "/mybucket/file.txt", "example.com", "admin", "secret", 2999)
 	w := serveRequest(g, http.MethodPut, url, strings.NewReader("presigned data"), noAuth())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -1213,7 +1229,7 @@ func TestVirtualHosted_PresignedURL(t *testing.T) {
 	bp := filepath.Join(syncDir, "mybucket")
 	os.Mkdir(bp, 0o755)
 
-	url := "/upload.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin%2F20260206%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260206T163218Z&X-Amz-Expires=2999&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=abc123"
+	url := presignV4(http.MethodPut, "/upload.txt", "mybucket.localhost:9200", "admin", "secret", 2999)
 	headers := map[string]string{
 		"Host": "mybucket.localhost:9200",
 	}
