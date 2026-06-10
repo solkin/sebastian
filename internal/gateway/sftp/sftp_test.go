@@ -1444,3 +1444,67 @@ func TestUnknownPacketType(t *testing.T) {
 		t.Errorf("expected OP_UNSUPPORTED, got %d", code)
 	}
 }
+
+// --- Malformed subsystem request (panic regression) ---
+
+// TestSubsystemMalformedPayload_NoPanic sends a "subsystem" channel request whose
+// payload is shorter than the 4-byte SSH string length prefix. The old code did
+// string(req.Payload[4:]) and panicked, crashing the whole daemon (all gateways).
+// It must now be rejected gracefully, and the server must keep serving.
+func TestSubsystemMalformedPayload_NoPanic(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := testGateway(t, syncDir, "user", "pass")
+
+	config := &ssh.ClientConfig{
+		User:            "user",
+		Auth:            []ssh.AuthMethod{ssh.Password("pass")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	conn, err := ssh.Dial("tcp", addr, config)
+	if err != nil {
+		t.Fatalf("ssh dial: %v", err)
+	}
+	defer conn.Close()
+
+	ch, reqs, err := conn.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+	go ssh.DiscardRequests(reqs)
+
+	// 2-byte payload cannot hold the 4-byte length prefix — previously panicked.
+	ok, err := ch.SendRequest("subsystem", true, []byte{0x00, 0x00})
+	if err != nil {
+		t.Fatalf("send malformed subsystem: %v", err)
+	}
+	if ok {
+		t.Fatalf("malformed subsystem request should be rejected")
+	}
+
+	// The daemon must still be alive and able to serve a valid subsystem request
+	// on the same channel (handleSession loops with `continue` after rejection).
+	ok, err = ch.SendRequest("subsystem", true, marshalString(nil, "sftp"))
+	if err != nil {
+		t.Fatalf("send valid subsystem: %v", err)
+	}
+	if !ok {
+		t.Fatalf("valid subsystem request should be accepted")
+	}
+
+	sftpInit(t, ch)
+
+	var rp []byte
+	rp = marshalUint32(rp, 1)
+	rp = marshalString(rp, ".")
+	if err := writePacket(ch, sshFxpRealpath, rp); err != nil {
+		t.Fatalf("write realpath: %v", err)
+	}
+	pktType, _, err := readPacket(ch)
+	if err != nil {
+		t.Fatalf("read realpath reply: %v", err)
+	}
+	if pktType != sshFxpName {
+		t.Fatalf("expected NAME reply after malformed request, got %d", pktType)
+	}
+}

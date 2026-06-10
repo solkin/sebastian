@@ -130,6 +130,11 @@ func (g *Gateway) Stop(ctx context.Context) error {
 func (g *Gateway) handleConnection(conn net.Conn) {
 	defer g.wg.Done()
 	defer conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("sftp connection panic recovered", "remote", conn.RemoteAddr(), "panic", r)
+		}
+	}()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, g.sshConfig)
 	if err != nil {
@@ -160,9 +165,17 @@ func (g *Gateway) handleConnection(conn net.Conn) {
 
 func (g *Gateway) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("sftp session panic recovered", "panic", r)
+		}
+	}()
 
 	for req := range reqs {
-		if req.Type != "subsystem" || string(req.Payload[4:]) != "sftp" {
+		// The subsystem name is an SSH string (4-byte length prefix + bytes).
+		// Parse it safely; a malformed or short payload must not panic the server.
+		name, _, err := unmarshalString(req.Payload)
+		if req.Type != "subsystem" || err != nil || name != "sftp" {
 			if req.WantReply {
 				req.Reply(false, nil)
 			}
