@@ -4,8 +4,6 @@ package s3
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -225,10 +223,4 @@ func (g *Gateway) authenticate(r *http.Request) bool {
 	}
 
 	return false
-}
-
-// computeETag returns the hex-encoded SHA256 of data, formatted as an S3 ETag.
-func computeETag(data []byte) string {
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:]))
 }
