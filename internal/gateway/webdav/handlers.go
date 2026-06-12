@@ -324,6 +324,12 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject moving a resource onto itself or into its own subtree.
+	if isSameOrUnder(dstFull, srcFull) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	_, statErr := os.Stat(dstFull)
 	overwrite := r.Header.Get("Overwrite") != "F"
 	dstExists := statErr == nil
@@ -377,6 +383,13 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Reject copying a resource onto itself or into its own subtree, which would
+	// otherwise recurse without bound and exhaust the disk.
+	if isSameOrUnder(dstFull, srcFull) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -512,6 +525,18 @@ func xmlEscapeString(s string) string {
 	var b strings.Builder
 	xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+// isSameOrUnder reports whether path is dir itself or lies within dir's subtree.
+// It is used to reject COPY/MOVE whose destination is the source or a descendant
+// of the source, which would otherwise recurse without bound.
+func isSameOrUnder(path, dir string) bool {
+	absPath, err1 := filepath.Abs(path)
+	absDir, err2 := filepath.Abs(dir)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return absPath == absDir || strings.HasPrefix(absPath, absDir+string(filepath.Separator))
 }
 
 // copyFile copies a single file using a temp file + atomic rename.

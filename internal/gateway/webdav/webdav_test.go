@@ -779,6 +779,41 @@ func TestCopy_IntoSubdir(t *testing.T) {
 	}
 }
 
+func TestCopy_DirectoryIntoOwnSubtree(t *testing.T) {
+	g, ts := newTestGateway(t, "", "")
+	os.MkdirAll(filepath.Join(g.rootDir, "dir"), 0o755)
+	os.WriteFile(filepath.Join(g.rootDir, "dir", "file.txt"), []byte("data"), 0o644)
+
+	// Copying a collection into its own subtree must be rejected, not recurse forever.
+	resp := doReq(t, "COPY", ts.URL+"/dir", "", map[string]string{
+		"Destination": ts.URL + "/dir/sub",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for copy into own subtree, got %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(g.rootDir, "dir", "sub")); !os.IsNotExist(err) {
+		t.Fatal("destination must not be created when copy is rejected")
+	}
+}
+
+func TestMove_DirectoryIntoOwnSubtree(t *testing.T) {
+	g, ts := newTestGateway(t, "", "")
+	os.MkdirAll(filepath.Join(g.rootDir, "dir"), 0o755)
+	os.WriteFile(filepath.Join(g.rootDir, "dir", "file.txt"), []byte("data"), 0o644)
+
+	resp := doReq(t, "MOVE", ts.URL+"/dir", "", map[string]string{
+		"Destination": ts.URL + "/dir/sub",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for move into own subtree, got %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(g.rootDir, "dir", "file.txt")); err != nil {
+		t.Fatal("source must remain intact when move is rejected")
+	}
+}
+
 // --- MKCOL edge cases ---
 
 func TestMkcol_Root(t *testing.T) {
