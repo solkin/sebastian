@@ -3,6 +3,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -47,7 +48,45 @@ func SafePath(rootDir, reqPath string) (relPath string, fullPath string, err err
 		return "", "", fmt.Errorf("path traversal")
 	}
 
+	if err := verifyNoSymlinkEscape(rootDir, full); err != nil {
+		return "", "", err
+	}
+
 	return cleaned, full, nil
+}
+
+// verifyNoSymlinkEscape ensures that, after resolving symlinks, full still lies
+// within rootDir. full need not exist yet: the nearest existing ancestor is
+// resolved and the remaining (not-yet-created) components are re-appended. This
+// closes symlink-based escapes that the textual check above cannot detect.
+func verifyNoSymlinkEscape(rootDir, full string) error {
+	realRoot, err := filepath.EvalSymlinks(rootDir)
+	if err != nil {
+		// rootDir normally exists; if it cannot be resolved, rely on the textual
+		// check already performed by the caller.
+		return nil
+	}
+
+	cur := full
+	rest := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if rest != "" {
+				resolved = filepath.Join(resolved, rest)
+			}
+			if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+				return fmt.Errorf("path traversal")
+			}
+			return nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the filesystem root without resolving; the textual check stands.
+			return nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // CheckBasicAuth validates HTTP Basic Auth credentials.
@@ -60,7 +99,9 @@ func CheckBasicAuth(r *http.Request, username, password string) bool {
 	if !ok {
 		return false
 	}
-	return user == username && pass == password
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(username))
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(password))
+	return userOK&passOK == 1
 }
 
 // ResponseLogger wraps http.ResponseWriter to capture status code and body size.

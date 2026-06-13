@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -53,7 +54,9 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 
 	if cfg.Username != "" && cfg.Password != "" {
 		sshCfg.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			if conn.User() == cfg.Username && string(password) == cfg.Password {
+			userOK := subtle.ConstantTimeCompare([]byte(conn.User()), []byte(cfg.Username))
+			passOK := subtle.ConstantTimeCompare(password, []byte(cfg.Password))
+			if userOK&passOK == 1 {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("authentication failed for %s", conn.User())

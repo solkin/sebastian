@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -99,6 +101,41 @@ func TestSafePath_LeadingSlash(t *testing.T) {
 	}
 	if full != "/data/subdir/file.txt" {
 		t.Fatalf("got %q", full)
+	}
+}
+
+func TestSafePath_SymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlink inside root pointing outside must not allow escaping root.
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if _, _, err := SafePath(root, "/escape/secret.txt"); err == nil {
+		t.Fatal("expected traversal error through an escaping symlink")
+	}
+	// Even a not-yet-existing target under the escaping symlink must be rejected.
+	if _, _, err := SafePath(root, "/escape/new.txt"); err == nil {
+		t.Fatal("expected traversal error for new file under escaping symlink")
+	}
+
+	// A symlink that stays within root is allowed.
+	sub := filepath.Join(root, "real")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "f.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sub, filepath.Join(root, "inlink")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if _, _, err := SafePath(root, "/inlink/f.txt"); err != nil {
+		t.Fatalf("symlink within root should be allowed: %v", err)
 	}
 }
 
