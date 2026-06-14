@@ -87,6 +87,43 @@ func TestAuthDisabled(t *testing.T) {
 	}
 }
 
+// --- CSRF tests ---
+
+func TestCSRF_CrossOriginPostRejected(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+
+	// A cross-origin POST must be rejected before touching the filesystem.
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "evil"}),
+		func(r *http.Request) { r.Header.Set("Origin", "http://attacker.example") })
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST, got %d", w.Code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "evil")); !os.IsNotExist(err) {
+		t.Fatal("cross-origin request must not create the directory")
+	}
+}
+
+func TestCSRF_SameOriginPostAllowed(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "ok"}),
+		func(r *http.Request) { r.Header.Set("Origin", "http://"+r.Host) })
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for same-origin POST, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCSRF_NoOriginHeaderAllowed(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	// Non-browser API clients send no Origin/Referer and carry no ambient
+	// credentials, so they are not a CSRF vector and must still work.
+	w := serve(g, http.MethodPost, "/_api/mkdir", jsonBody(map[string]string{"path": "api"}), noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for header-less POST, got %d", w.Code)
+	}
+}
+
 // --- Page tests ---
 
 func TestServesHTMLPage(t *testing.T) {

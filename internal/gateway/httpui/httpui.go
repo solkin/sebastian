@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/solkin/sebastian/internal/gateway"
@@ -106,6 +107,14 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) routeAPI(w http.ResponseWriter, r *http.Request) {
 	apiPath := strings.TrimPrefix(r.URL.Path, "/_api")
 
+	// CSRF: state-changing requests must come from the same origin. Browsers send
+	// Origin on cross-site POSTs, so a forged request from another site is rejected
+	// while same-origin UI requests and non-browser API clients are allowed.
+	if r.Method == http.MethodPost && !sameOrigin(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	switch {
 	case apiPath == "/list" && r.Method == http.MethodGet:
 		g.handleList(w, r)
@@ -122,4 +131,28 @@ func (g *Gateway) routeAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
+}
+
+// sameOrigin reports whether a state-changing request originates from the same
+// host it targets. It compares the Origin (or Referer) host against the request
+// Host, ignoring scheme so it keeps working behind a TLS-terminating reverse
+// proxy. Requests carrying neither header (e.g. curl/API clients, which do not
+// send ambient browser credentials) are allowed.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if ref := r.Header.Get("Referer"); ref != "" {
+			if u, err := url.Parse(ref); err == nil {
+				origin = u.Scheme + "://" + u.Host
+			}
+		}
+	}
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == r.Host
 }

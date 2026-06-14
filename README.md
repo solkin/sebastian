@@ -141,6 +141,17 @@ Any S3 SDK or tool configured with the same credentials works out of the box.
 
 Leaving both keys empty disables authentication (all requests are allowed).
 
+## Deployment
+
+Sebastian serves plain HTTP (SFTP runs over SSH); it does not terminate TLS
+itself. Run it behind a reverse proxy (nginx, Caddy, Traefik, …) that terminates
+TLS for the S3, WebDAV, and HTTP UI ports. Configure the proxy to forward the
+original `Host` header — the HTTP UI's CSRF protection compares the request
+`Origin`/`Referer` host against it.
+
+The container image runs as a non-root user; bind-mounted data directories must
+be writable by that user.
+
 ## Building
 
 ```bash
