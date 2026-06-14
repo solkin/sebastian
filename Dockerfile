@@ -11,7 +11,14 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /build/sebastiand /usr/local/bin/sebastiand
 
+# Run as a non-root user that owns the data directory.
+RUN addgroup -S sebastian && adduser -S -G sebastian sebastian \
+    && mkdir -p /data/files \
+    && chown -R sebastian:sebastian /data
+
 VOLUME /data/files
+
+USER sebastian
 
 EXPOSE 9200 9300 9400 9500
 

@@ -625,6 +625,47 @@ func TestReaddirSecondCallEOF(t *testing.T) {
 	}
 }
 
+func TestReaddirPaginatesLargeDirectory(t *testing.T) {
+	syncDir := t.TempDir()
+	const total = 600 // > readdirBatchSize, so the listing spans multiple replies
+	for i := 0; i < total; i++ {
+		if err := os.WriteFile(filepath.Join(syncDir, fmt.Sprintf("f%04d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpendir(t, ch, 1, "/")
+	seen := make(map[string]bool)
+	pages := 0
+	for id := uint32(2); ; id++ {
+		names := sftpReaddir(t, ch, id, handle)
+		if names == nil {
+			break
+		}
+		pages++
+		if len(names) > readdirBatchSize {
+			t.Fatalf("page returned %d entries, exceeds batch size %d", len(names), readdirBatchSize)
+		}
+		for _, n := range names {
+			if seen[n] {
+				t.Fatalf("duplicate entry across pages: %s", n)
+			}
+			seen[n] = true
+		}
+	}
+
+	if len(seen) != total {
+		t.Fatalf("expected %d entries across pages, got %d", total, len(seen))
+	}
+	if pages < 2 {
+		t.Fatalf("expected listing to be paged across >=2 replies, got %d", pages)
+	}
+}
+
 func TestWriteAtOffset(t *testing.T) {
 	syncDir := t.TempDir()
 	addr := testGateway(t, syncDir, "user", "pass")

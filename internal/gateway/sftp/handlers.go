@@ -13,10 +13,12 @@ import (
 )
 
 type handleEntry struct {
-	path     string
-	file     *os.File
-	isDir    bool
-	dirRead  bool
+	path    string
+	file    *os.File
+	isDir   bool
+	entries []os.DirEntry // directory entries, populated lazily on first READDIR
+	dirPos  int           // index of the next entry to return
+	dirRead bool          // whether entries has been populated
 }
 
 type session struct {
@@ -226,6 +228,10 @@ func (s *session) handleOpendir(payload []byte) {
 	writePacket(s.ch, sshFxpHandle, resp)
 }
 
+// readdirBatchSize bounds how many entries a single SSH_FXP_READDIR returns, so
+// large directories are paged across replies instead of sent in one huge packet.
+const readdirBatchSize = 256
+
 func (s *session) handleReaddir(payload []byte) {
 	id, rest, err := unmarshalUint32(payload)
 	if err != nil {
@@ -237,42 +243,57 @@ func (s *session) handleReaddir(payload []byte) {
 		return
 	}
 
+	// Populate the entry list once (under the lock), then hand out a bounded batch
+	// per call. All handle state is mutated under s.mu so concurrent READDIRs on
+	// the same handle cannot race.
 	s.mu.Lock()
 	entry, ok := s.handles[handle]
-	s.mu.Unlock()
 	if !ok || !entry.isDir {
+		s.mu.Unlock()
 		s.sendStatus(id, sshFxFailure, "invalid handle")
 		return
 	}
+	if !entry.dirRead {
+		entries, rerr := os.ReadDir(entry.path)
+		if rerr != nil {
+			s.mu.Unlock()
+			s.sendStatus(id, sshFxFailure, "read failed")
+			return
+		}
+		entry.entries = entries
+		entry.dirRead = true
+	}
+	start := entry.dirPos
+	end := start + readdirBatchSize
+	if end > len(entry.entries) {
+		end = len(entry.entries)
+	}
+	batch := entry.entries[start:end]
+	entry.dirPos = end
+	s.mu.Unlock()
 
-	if entry.dirRead {
-		s.sendStatus(id, sshFxEOF, "")
-		return
+	// Marshal into a temporary buffer first so the entry count reflects only the
+	// entries we actually emit (an entry may vanish between ReadDir and Info).
+	var body []byte
+	count := 0
+	for _, e := range batch {
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		body = marshalFileInfo(body, e.Name(), fi)
+		count++
 	}
 
-	entries, err := os.ReadDir(entry.path)
-	if err != nil {
-		s.sendStatus(id, sshFxFailure, "read failed")
-		return
-	}
-
-	entry.dirRead = true
-
-	if len(entries) == 0 {
+	if count == 0 {
 		s.sendStatus(id, sshFxEOF, "")
 		return
 	}
 
 	var resp []byte
 	resp = marshalUint32(resp, id)
-	resp = marshalUint32(resp, uint32(len(entries)))
-	for _, e := range entries {
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		resp = marshalFileInfo(resp, e.Name(), fi)
-	}
+	resp = marshalUint32(resp, uint32(count))
+	resp = append(resp, body...)
 	writePacket(s.ch, sshFxpName, resp)
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1295,6 +1296,47 @@ func TestETag_ListMatchesHead(t *testing.T) {
 	wHead := serveRequest(g, http.MethodHead, "/mybucket/obj.txt", nil, noAuth())
 	if headETag := wHead.Header().Get("ETag"); headETag != listETag {
 		t.Fatalf("ETag mismatch: LIST=%q HEAD=%q", listETag, headETag)
+	}
+}
+
+// TestETag_FormatIsSizeMtimeEverywhere asserts that every operation that reports
+// an ETag (PUT, HEAD, GET, and listings) uses the size+mtime surrogate format
+// `"<hex>-<hex>"` and that the value is identical across all of them.
+func TestETag_FormatIsSizeMtimeEverywhere(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755)
+
+	format := regexp.MustCompile(`^"[0-9a-f]+-[0-9a-f]+"$`)
+
+	put := serveRequest(g, http.MethodPut, "/mybucket/obj.txt", strings.NewReader("hello"), noAuth())
+	if put.Code != http.StatusOK {
+		t.Fatalf("put: expected 200, got %d", put.Code)
+	}
+	head := serveRequest(g, http.MethodHead, "/mybucket/obj.txt", nil, noAuth())
+	get := serveRequest(g, http.MethodGet, "/mybucket/obj.txt", nil, noAuth())
+
+	list := serveRequest(g, http.MethodGet, "/mybucket?list-type=2", nil, noAuth())
+	var lr ListBucketResultV2
+	if err := xml.Unmarshal(list.Body.Bytes(), &lr); err != nil {
+		t.Fatalf("unmarshal listing: %v", err)
+	}
+	if len(lr.Contents) != 1 {
+		t.Fatalf("expected 1 object in listing, got %d", len(lr.Contents))
+	}
+
+	etags := map[string]string{
+		"PUT":  put.Header().Get("ETag"),
+		"HEAD": head.Header().Get("ETag"),
+		"GET":  get.Header().Get("ETag"),
+		"LIST": lr.Contents[0].ETag,
+	}
+	for op, etag := range etags {
+		if !format.MatchString(etag) {
+			t.Errorf("%s ETag %q is not the size+mtime format", op, etag)
+		}
+	}
+	if etags["PUT"] != etags["HEAD"] || etags["HEAD"] != etags["GET"] || etags["GET"] != etags["LIST"] {
+		t.Fatalf("ETags differ across operations: %#v", etags)
 	}
 }
 

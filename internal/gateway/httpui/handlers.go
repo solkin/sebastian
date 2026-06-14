@@ -227,13 +227,13 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		tmpPath := filepath.Join(destDir, ".seb-tmp-upload-"+filepath.Base(destPath))
-		dst, err := os.Create(tmpPath)
+		dst, err := os.CreateTemp(destDir, ".seb-tmp-upload-*")
 		if err != nil {
 			src.Close()
 			jsonError(w, http.StatusInternalServerError, "failed to create file")
 			return
 		}
+		tmpPath := dst.Name()
 
 		_, copyErr := io.Copy(dst, src)
 		src.Close()
