@@ -71,9 +71,9 @@ func (s *session) handlePacket(pktType byte, payload []byte) {
 	case sshFxpRealpath:
 		s.handleRealpath(payload)
 	case sshFxpStat:
-		s.handleStat(payload)
+		s.handleStat(payload, os.Stat)
 	case sshFxpLstat:
-		s.handleStat(payload)
+		s.handleStat(payload, os.Lstat)
 	case sshFxpFstat:
 		s.handleFstat(payload)
 	case sshFxpOpendir:
@@ -140,7 +140,9 @@ func (s *session) handleRealpath(payload []byte) {
 	writePacket(s.ch, sshFxpName, resp)
 }
 
-func (s *session) handleStat(payload []byte) {
+// handleStat serves SSH_FXP_STAT (statFn=os.Stat, follows symlinks) and
+// SSH_FXP_LSTAT (statFn=os.Lstat, reports the link itself).
+func (s *session) handleStat(payload []byte, statFn func(string) (os.FileInfo, error)) {
 	id, rest, err := unmarshalUint32(payload)
 	if err != nil {
 		return
@@ -157,7 +159,7 @@ func (s *session) handleStat(payload []byte) {
 		return
 	}
 
-	fi, err := os.Stat(fullPath)
+	fi, err := statFn(fullPath)
 	if err != nil {
 		s.sendStatus(id, sshFxNoSuchFile, "no such file")
 		return
@@ -188,7 +190,15 @@ func (s *session) handleFstat(payload []byte) {
 		return
 	}
 
-	fi, err := os.Stat(entry.path)
+	// Stat the open descriptor when we have one, so FSTAT reflects exactly the
+	// file the handle refers to (no TOCTOU re-resolution of the path). Directory
+	// handles carry no *os.File, so fall back to the path for those.
+	var fi os.FileInfo
+	if entry.file != nil {
+		fi, err = entry.file.Stat()
+	} else {
+		fi, err = os.Stat(entry.path)
+	}
 	if err != nil {
 		s.sendStatus(id, sshFxNoSuchFile, "no such file")
 		return
@@ -407,6 +417,17 @@ func (s *session) handleRead(payload []byte) {
 		length = 1 << 18
 	}
 
+	// A zero-length read is valid and must return empty data, not an error: with
+	// an empty buffer ReadAt returns (0, nil), which would otherwise fall into the
+	// "read error" branch below.
+	if length == 0 {
+		var resp []byte
+		resp = marshalUint32(resp, id)
+		resp = marshalBytes(resp, nil)
+		writePacket(s.ch, sshFxpData, resp)
+		return
+	}
+
 	buf := make([]byte, length)
 	n, err := entry.file.ReadAt(buf, int64(offset))
 	if n == 0 {
@@ -486,7 +507,12 @@ func (s *session) handleClose(payload []byte) {
 	}
 
 	if entry.file != nil {
-		entry.file.Close()
+		// Report a Close error (e.g. a deferred write/flush failure) instead of
+		// claiming success — otherwise a truncated upload looks like it succeeded.
+		if err := entry.file.Close(); err != nil {
+			s.sendStatus(id, sshFxFailure, err.Error())
+			return
+		}
 	}
 	s.sendStatus(id, sshFxOk, "")
 }
