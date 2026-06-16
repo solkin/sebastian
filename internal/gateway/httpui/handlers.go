@@ -2,8 +2,8 @@ package httpui
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -160,8 +160,16 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(fullPath)))
-	http.ServeContent(w, r, filepath.Base(fullPath), info.ModTime(), f)
+	// Build the header via mime.FormatMediaType so a filename containing quotes,
+	// control characters, or non-ASCII cannot break out of the header value
+	// (header injection) — it is properly quoted/encoded, with a safe fallback.
+	name := filepath.Base(fullPath)
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Disposition", disposition)
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
 // handleUpload accepts multipart file uploads.
