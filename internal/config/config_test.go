@@ -149,6 +149,28 @@ gateways:
 	}
 }
 
+func TestSecurityWarnings(t *testing.T) {
+	open := &Config{Gateways: Gateways{
+		S3:     S3Config{Enabled: true},
+		WebDAV: WebDAVConfig{Enabled: true},
+		HTTP:   HTTPConfig{Enabled: true},
+		SFTP:   SFTPConfig{Enabled: true},
+	}}
+	if got := SecurityWarnings(open); len(got) != 4 {
+		t.Fatalf("expected 4 warnings for open gateways, got %d: %v", len(got), got)
+	}
+
+	secured := &Config{Gateways: Gateways{
+		S3:     S3Config{Enabled: true, AccessKey: "a", SecretKey: "b"},
+		WebDAV: WebDAVConfig{Enabled: true, Username: "u", Password: "p"},
+		HTTP:   HTTPConfig{Enabled: false},
+		SFTP:   SFTPConfig{Enabled: true, Username: "u", Password: "p"},
+	}}
+	if got := SecurityWarnings(secured); len(got) != 0 {
+		t.Fatalf("expected no warnings for secured/disabled gateways, got %v", got)
+	}
+}
+
 func TestLoad_NoFile(t *testing.T) {
 	t.Setenv("SEBASTIAN_ROOT_DIR", "/tmp/test")
 	t.Setenv("SEBASTIAN_S3_ENABLED", "true")

@@ -47,6 +47,10 @@ func main() {
 		"sftp", cfg.Gateways.SFTP.Enabled,
 	)
 
+	for _, warning := range config.SecurityWarnings(cfg) {
+		logger.Warn("insecure configuration", "detail", warning)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

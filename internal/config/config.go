@@ -161,3 +161,26 @@ func validate(cfg *Config) error {
 
 	return nil
 }
+
+// SecurityWarnings returns messages for enabled gateways that run without any
+// credentials configured. Such gateways accept unauthenticated access (the
+// documented open mode), which is easy to enable by accident — e.g. a default
+// container run — so the operator is warned at startup rather than silently
+// exposing the filesystem.
+func SecurityWarnings(cfg *Config) []string {
+	var warnings []string
+	g := cfg.Gateways
+	if g.S3.Enabled && g.S3.AccessKey == "" && g.S3.SecretKey == "" {
+		warnings = append(warnings, "S3 gateway is enabled without access_key/secret_key; it accepts unauthenticated requests")
+	}
+	if g.WebDAV.Enabled && g.WebDAV.Username == "" && g.WebDAV.Password == "" {
+		warnings = append(warnings, "WebDAV gateway is enabled without username/password; it accepts unauthenticated requests")
+	}
+	if g.HTTP.Enabled && g.HTTP.Username == "" && g.HTTP.Password == "" {
+		warnings = append(warnings, "HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests")
+	}
+	if g.SFTP.Enabled && g.SFTP.Username == "" && g.SFTP.Password == "" {
+		warnings = append(warnings, "SFTP gateway is enabled without username/password; it accepts unauthenticated connections")
+	}
+	return warnings
+}
