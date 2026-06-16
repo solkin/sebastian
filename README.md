@@ -43,6 +43,7 @@ Sebastian can be configured via a YAML file, environment variables, or both. Env
 
 ```yaml
 root_dir: /data/files
+max_upload_bytes: 0           # cap a single upload (bytes); 0 = unlimited for S3/WebDAV, 1 GiB default for HTTP UI
 
 gateways:
   s3:
@@ -74,6 +75,7 @@ gateways:
 | Variable | Description | Default |
 |---|---|---|
 | `SEBASTIAN_ROOT_DIR` | Root directory to serve | `/data/files` |
+| `SEBASTIAN_MAX_UPLOAD_BYTES` | Max size of a single upload in bytes (`0` = unlimited for S3/WebDAV; HTTP UI defaults to 1 GiB) | `0` |
 | `SEBASTIAN_S3_ENABLED` | Enable S3 gateway | `false` |
 | `SEBASTIAN_S3_LISTEN_ADDR` | S3 listen address | `:9200` |
 | `SEBASTIAN_S3_ACCESS_KEY` | S3 access key (empty = no auth) | |
