@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 // --- S3 XML response types ---
@@ -129,13 +131,28 @@ func writeXML(w http.ResponseWriter, statusCode int, v interface{}) {
 }
 
 // bucketPath returns the absolute path for a bucket (first-level dir in rootDir).
-func (g *Gateway) bucketPath(bucket string) string {
-	return filepath.Join(g.rootDir, bucket)
+// It routes through gateway.SafePath so a bucket directory that is a symlink
+// escaping rootDir is rejected (ok=false), matching the other gateways.
+func (g *Gateway) bucketPath(bucket string) (string, bool) {
+	_, full, err := gateway.SafePath(g.rootDir, bucket)
+	if err != nil {
+		return "", false
+	}
+	return full, true
 }
 
-// objectPath returns the absolute path for an object within a bucket.
-func (g *Gateway) objectPath(bucket, key string) string {
-	return filepath.Join(g.rootDir, bucket, filepath.FromSlash(key))
+// objectPath returns the absolute path for an object within a bucket. It routes
+// through gateway.SafePath (which resolves symlinks and rejects any escape from
+// rootDir) and additionally confirms the result stays within the bucket dir.
+func (g *Gateway) objectPath(bucket, key string) (string, bool) {
+	_, full, err := gateway.SafePath(g.rootDir, bucket+"/"+key)
+	if err != nil {
+		return "", false
+	}
+	if !isUnderDir(filepath.Join(g.rootDir, bucket), full) {
+		return "", false
+	}
+	return full, true
 }
 
 // validateBucketName checks that a bucket name is safe.
@@ -221,7 +238,11 @@ func (g *Gateway) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -243,8 +264,8 @@ func (g *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	bp := g.bucketPath(bucket)
-	if !isUnderDir(g.rootDir, bp) {
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
@@ -274,8 +295,8 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	bp := g.bucketPath(bucket)
-	if !isUnderDir(g.rootDir, bp) {
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
@@ -314,7 +335,11 @@ func (g *Gateway) handleGetBucketLocation(w http.ResponseWriter, r *http.Request
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -333,7 +358,11 @@ func (g *Gateway) handleGetBucketVersioning(w http.ResponseWriter, r *http.Reque
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -352,7 +381,11 @@ func (g *Gateway) handleGetBucketACL(w http.ResponseWriter, r *http.Request, buc
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
 		return
 	}
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -491,7 +524,11 @@ func (g *Gateway) handleListObjects(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	info, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -603,8 +640,8 @@ func (g *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
@@ -633,8 +670,8 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
@@ -665,13 +702,17 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
 
-	bp := g.bucketPath(bucket)
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
 	bInfo, err := os.Stat(bp)
 	if os.IsNotExist(err) || (err == nil && !bInfo.IsDir()) {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
@@ -729,8 +770,8 @@ func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	op := g.objectPath(bucket, key)
-	if !isUnderDir(g.bucketPath(bucket), op) {
+	op, ok := g.objectPath(bucket, key)
+	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
 		return
 	}
