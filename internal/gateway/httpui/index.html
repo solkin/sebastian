@@ -269,6 +269,25 @@ document.addEventListener('DOMContentLoaded',()=>{
 
   window.addEventListener('popstate',()=>{curPath=norm(location.pathname);pageOffset=pageFromURL();load()});
 
+  $('breadcrumbs').addEventListener('click',ev=>{
+    const a=ev.target.closest('a[data-nav]');
+    if(!a)return;
+    ev.preventDefault();
+    nav(a.getAttribute('data-nav'));
+  });
+
+  $('file-list').addEventListener('click',ev=>{
+    const t=ev.target.closest('[data-act]');
+    if(!t)return;
+    const act=t.getAttribute('data-act');
+    if(act==='nav')nav(t.getAttribute('data-path'));
+    else if(act==='dl')dl(t.getAttribute('data-path'));
+    else if(act==='ren')ren(t.getAttribute('data-path'),t.getAttribute('data-name'));
+    else if(act==='del')del(t.getAttribute('data-path'),t.getAttribute('data-name'),t.getAttribute('data-dir')==='true');
+    else if(act==='prev')prevPage();
+    else if(act==='next')nextPage();
+  });
+
   $('btn-upload').addEventListener('click',()=>$('file-input').click());
   $('file-input').addEventListener('change',e=>{
     if(e.target.files.length){uploadFlat(e.target.files);e.target.value=''}
@@ -345,7 +364,7 @@ function nav(p){
 
 function bread(){
   const el=$('breadcrumbs');
-  let h='<a href="/" onclick="event.preventDefault();nav(\'\')">Home</a>';
+  let h='<a href="/" data-nav="">Home</a>';
   if(curPath){
     const parts=curPath.split('/');
     let acc='';
@@ -353,7 +372,7 @@ function bread(){
       acc+=(acc?'/':'')+s;
       h+='<span class="sep">/</span>';
       if(i===parts.length-1) h+='<span class="cur">'+esc(s)+'</span>';
-      else{const a=acc;h+='<a href="/'+ea(a)+'/" onclick="event.preventDefault();nav(\''+ea(a)+'\')">'+esc(s)+'</a>'}
+      else h+='<a href="/'+esc(acc)+'/" data-nav="'+esc(acc)+'">'+esc(s)+'</a>';
     });
   }
   el.innerHTML=h;
@@ -376,14 +395,15 @@ function render(entries){
     const svg=e.is_dir?IC_FOLDER:IC_FILE;
     const sz=e.is_dir?'\u2014':fmtSize(e.size);
     const dt=fmtDate(e.mod_time);
+    const ap=esc(fp),an=esc(e.name);
     h+='<div class="file-item">';
     h+='<div class="ic '+ic+'">'+svg+'</div>';
-    if(e.is_dir) h+='<div class="name" onclick="nav(\''+ea(fp)+'\')">'+esc(e.name)+'</div>';
-    else h+='<div class="name" onclick="dl(\''+ea(fp)+'\')">'+esc(e.name)+'</div>';
+    if(e.is_dir) h+='<div class="name" data-act="nav" data-path="'+ap+'">'+esc(e.name)+'</div>';
+    else h+='<div class="name" data-act="dl" data-path="'+ap+'">'+esc(e.name)+'</div>';
     h+='<div class="acts">';
-    if(!e.is_dir) h+='<button class="btn-icon" onclick="dl(\''+ea(fp)+'\')" title="Download">'+IC_DL+'</button>';
-    h+='<button class="btn-icon" onclick="ren(\''+ea(fp)+'\',\''+ea(e.name)+'\')" title="Rename">'+IC_EDIT+'</button>';
-    h+='<button class="btn-icon delete" onclick="del(\''+ea(fp)+'\',\''+ea(e.name)+'\','+e.is_dir+')" title="Delete">'+IC_DEL+'</button>';
+    if(!e.is_dir) h+='<button class="btn-icon" data-act="dl" data-path="'+ap+'" title="Download">'+IC_DL+'</button>';
+    h+='<button class="btn-icon" data-act="ren" data-path="'+ap+'" data-name="'+an+'" title="Rename">'+IC_EDIT+'</button>';
+    h+='<button class="btn-icon delete" data-act="del" data-path="'+ap+'" data-name="'+an+'" data-dir="'+e.is_dir+'" title="Delete">'+IC_DEL+'</button>';
     h+='</div>';
     h+='<div class="size">'+sz+'</div>';
     h+='<div class="date">'+dt+'</div>';
@@ -395,9 +415,9 @@ function render(entries){
     const hasPrev=pageOffset>0;
     const hasNext=pageOffset+PAGE_SIZE<totalEntries;
     h+='<div class="pager">';
-    h+='<button onclick="prevPage()"'+(hasPrev?'':' disabled')+'>Previous</button>';
+    h+='<button data-act="prev"'+(hasPrev?'':' disabled')+'>Previous</button>';
     h+='<span class="info">'+from+' \u2013 '+to+' of '+totalEntries.toLocaleString()+'</span>';
-    h+='<button onclick="nextPage()"'+(hasNext?'':' disabled')+'>Next</button>';
+    h+='<button data-act="next"'+(hasNext?'':' disabled')+'>Next</button>';
     h+='</div>';
   }
   el.innerHTML=h;
@@ -527,7 +547,6 @@ function toast(msg,err){
 function $(id){return document.getElementById(id)}
 function norm(p){return p.replace(/^\/|\/$/g,'')}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function ea(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
 
 function fmtSize(b){
   if(b===0)return'0 B';
