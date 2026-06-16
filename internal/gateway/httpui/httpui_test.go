@@ -315,6 +315,47 @@ func TestDownloadFile(t *testing.T) {
 	}
 }
 
+func TestSecurityHeadersAndNonce(t *testing.T) {
+	g, _ := newTestGateway(t, "", "")
+
+	w := serve(g, http.MethodGet, "/", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected nosniff, got %q", got)
+	}
+	if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("expected X-Frame-Options DENY, got %q", got)
+	}
+
+	csp := w.Header().Get("Content-Security-Policy")
+	const marker = "script-src 'nonce-"
+	i := strings.Index(csp, marker)
+	if i < 0 {
+		t.Fatalf("expected script-src nonce in CSP, got %q", csp)
+	}
+	nonce := csp[i+len(marker):]
+	nonce = nonce[:strings.IndexByte(nonce, '\'')]
+	if nonce == "" {
+		t.Fatal("empty CSP nonce")
+	}
+
+	body := w.Body.String()
+	if strings.Contains(body, noncePlaceholder) {
+		t.Fatal("served page still contains the unsubstituted nonce placeholder")
+	}
+	if !strings.Contains(body, `<script nonce="`+nonce+`">`) {
+		t.Fatalf("served page script tag does not carry the CSP nonce %q", nonce)
+	}
+
+	// The nonce must be fresh per request, otherwise it provides no protection.
+	csp2 := serve(g, http.MethodGet, "/", nil, noAuth()).Header().Get("Content-Security-Policy")
+	if csp2 == csp {
+		t.Fatal("CSP nonce should be unique per request")
+	}
+}
+
 func TestDownloadNestedFile(t *testing.T) {
 	g, dir := newTestGateway(t, "", "")
 	sub := filepath.Join(dir, "a", "b")

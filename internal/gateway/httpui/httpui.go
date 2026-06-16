@@ -4,8 +4,11 @@
 package httpui
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +18,13 @@ import (
 
 	"github.com/solkin/sebastian/internal/gateway"
 )
+
+// noncePlaceholder is replaced in the served page with a per-request CSP nonce.
+const noncePlaceholder = "__CSP_NONCE__"
+
+type contextKey string
+
+const nonceContextKey contextKey = "csp-nonce"
 
 //go:embed index.html
 var indexHTML []byte
@@ -46,10 +56,41 @@ func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 	mux.HandleFunc("/", g.route)
 
 	g.server = &http.Server{
-		Handler: gateway.LogMiddleware(g.logger, mux),
+		Handler: gateway.LogMiddleware(g.logger, securityHeaders(mux)),
 	}
 
 	return g
+}
+
+// securityHeaders sets defensive response headers on every response and threads
+// a per-request CSP nonce through the context for the page handler to inject.
+// The CSP locks scripts to the nonce (the XSS-relevant directive) and blocks
+// framing, plugins, and base-URI hijacking; inline styles remain allowed.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce := newNonce()
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'none'; "+
+				"script-src 'nonce-"+nonce+"'; "+
+				"style-src 'unsafe-inline'; "+
+				"img-src 'self' data:; "+
+				"connect-src 'self'; "+
+				"base-uri 'none'; "+
+				"form-action 'self'; "+
+				"frame-ancestors 'none'")
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), nonceContextKey, nonce)))
+	})
+}
+
+// newNonce returns a fresh base64 CSP nonce.
+func newNonce() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // Name returns the protocol name.
@@ -99,8 +140,10 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	nonce, _ := r.Context().Value(nonceContextKey).(string)
+	page := bytes.ReplaceAll(indexHTML, []byte(noncePlaceholder), []byte(nonce))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(indexHTML)
+	w.Write(page)
 }
 
 // routeAPI dispatches API requests.
