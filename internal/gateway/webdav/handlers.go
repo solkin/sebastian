@@ -191,6 +191,10 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if g.config.MaxUploadBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
+	}
+
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		g.logger.Error("put mkdir failed", "path", relName, "error", err)

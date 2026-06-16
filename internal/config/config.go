@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -12,8 +13,11 @@ import (
 
 // Config is the top-level configuration.
 type Config struct {
-	RootDir  string   `yaml:"root_dir"`
-	Gateways Gateways `yaml:"gateways"`
+	RootDir string `yaml:"root_dir"`
+	// MaxUploadBytes caps the size of a single uploaded object/file across the S3,
+	// WebDAV, and HTTP UI gateways. 0 means unlimited.
+	MaxUploadBytes int64    `yaml:"max_upload_bytes"`
+	Gateways       Gateways `yaml:"gateways"`
 }
 
 // Gateways groups all gateway configurations.
@@ -134,6 +138,12 @@ func applyEnv(cfg *Config) {
 	for env, ptr := range envBoolMap {
 		if v := os.Getenv(env); v != "" {
 			*ptr = parseBool(v)
+		}
+	}
+
+	if v := os.Getenv("SEBASTIAN_MAX_UPLOAD_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			cfg.MaxUploadBytes = n
 		}
 	}
 }

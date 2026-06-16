@@ -59,28 +59,31 @@ func main() {
 
 	if cfg.Gateways.S3.Enabled {
 		gw := s3.New(cfg.RootDir, s3.Config{
-			ListenAddr: cfg.Gateways.S3.ListenAddr,
-			AccessKey:  cfg.Gateways.S3.AccessKey,
-			SecretKey:  cfg.Gateways.S3.SecretKey,
-			Domain:     cfg.Gateways.S3.Domain,
+			ListenAddr:     cfg.Gateways.S3.ListenAddr,
+			AccessKey:      cfg.Gateways.S3.AccessKey,
+			SecretKey:      cfg.Gateways.S3.SecretKey,
+			Domain:         cfg.Gateways.S3.Domain,
+			MaxUploadBytes: cfg.MaxUploadBytes,
 		}, logger)
 		gateways = append(gateways, gw)
 	}
 
 	if cfg.Gateways.WebDAV.Enabled {
 		gw := webdav.New(cfg.RootDir, webdav.Config{
-			ListenAddr: cfg.Gateways.WebDAV.ListenAddr,
-			Username:   cfg.Gateways.WebDAV.Username,
-			Password:   cfg.Gateways.WebDAV.Password,
+			ListenAddr:     cfg.Gateways.WebDAV.ListenAddr,
+			Username:       cfg.Gateways.WebDAV.Username,
+			Password:       cfg.Gateways.WebDAV.Password,
+			MaxUploadBytes: cfg.MaxUploadBytes,
 		}, logger)
 		gateways = append(gateways, gw)
 	}
 
 	if cfg.Gateways.HTTP.Enabled {
 		gw := httpui.New(cfg.RootDir, httpui.Config{
-			ListenAddr: cfg.Gateways.HTTP.ListenAddr,
-			Username:   cfg.Gateways.HTTP.Username,
-			Password:   cfg.Gateways.HTTP.Password,
+			ListenAddr:     cfg.Gateways.HTTP.ListenAddr,
+			Username:       cfg.Gateways.HTTP.Username,
+			Password:       cfg.Gateways.HTTP.Password,
+			MaxUploadBytes: cfg.MaxUploadBytes,
 		}, logger)
 		gateways = append(gateways, gw)
 	}

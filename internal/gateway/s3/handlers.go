@@ -735,6 +735,10 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	if g.config.MaxUploadBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
+	}
+
 	dir := filepath.Dir(op)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		g.logger.Error("put object: mkdir failed", "bucket", bucket, "key", key, "error", err)

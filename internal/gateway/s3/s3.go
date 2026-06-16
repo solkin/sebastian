@@ -15,10 +15,11 @@ import (
 
 // Config holds S3 gateway configuration.
 type Config struct {
-	ListenAddr string `yaml:"listen_addr"`
-	AccessKey  string `yaml:"access_key"`
-	SecretKey  string `yaml:"secret_key"`
-	Domain     string `yaml:"domain"`
+	ListenAddr     string `yaml:"listen_addr"`
+	AccessKey      string `yaml:"access_key"`
+	SecretKey      string `yaml:"secret_key"`
+	Domain         string `yaml:"domain"`
+	MaxUploadBytes int64  // max object size for PutObject; 0 = unlimited
 }
 
 // Gateway implements the S3-compatible API.

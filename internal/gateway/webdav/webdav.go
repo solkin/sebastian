@@ -17,9 +17,10 @@ import (
 
 // Config holds WebDAV gateway configuration.
 type Config struct {
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	MaxUploadBytes int64  // max body size for PUT; 0 = unlimited
 }
 
 // Gateway implements the WebDAV protocol over HTTP.

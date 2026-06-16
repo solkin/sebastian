@@ -26,6 +26,10 @@ type contextKey string
 
 const nonceContextKey contextKey = "csp-nonce"
 
+// defaultMaxUploadBytes is the per-request upload cap used when the configured
+// MaxUploadBytes is 0 (unset).
+const defaultMaxUploadBytes = 1 << 30 // 1 GiB
+
 //go:embed index.html
 var indexHTML []byte
 
@@ -34,6 +38,9 @@ type Config struct {
 	ListenAddr string `yaml:"listen_addr"`
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
+	// MaxUploadBytes caps a single upload request body. 0 falls back to the
+	// built-in default (defaultMaxUploadBytes).
+	MaxUploadBytes int64
 }
 
 // Gateway implements the HTTP file server with web UI.

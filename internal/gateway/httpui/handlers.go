@@ -174,7 +174,11 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 // handleUpload accepts multipart file uploads.
 func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<30) // 1 GB limit
+	limit := int64(defaultMaxUploadBytes)
+	if g.config.MaxUploadBytes > 0 {
+		limit = g.config.MaxUploadBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		jsonError(w, http.StatusBadRequest, "failed to parse upload")
