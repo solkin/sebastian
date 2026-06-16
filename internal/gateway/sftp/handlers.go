@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -95,8 +96,10 @@ func (s *session) handlePacket(pktType byte, payload []byte) {
 		s.handleRmdir(payload)
 	case sshFxpRename:
 		s.handleRename(payload)
-	case sshFxpSetstat, sshFxpFsetstat:
+	case sshFxpSetstat:
 		s.handleSetstat(payload)
+	case sshFxpFsetstat:
+		s.handleFsetstat(payload)
 	case sshFxpReadlink:
 		s.handleReadlink(payload)
 	case sshFxpSymlink:
@@ -623,9 +626,100 @@ func (s *session) handleRename(payload []byte) {
 	s.sendStatus(id, sshFxOk, "")
 }
 
+// handleSetstat applies attributes to a path (SSH_FXP_SETSTAT). Only size
+// (truncate), permissions (chmod) and access/mod times (chtimes) are applied;
+// ownership is ignored. Previously this silently returned success without doing
+// anything, so a client's chmod/truncate was reported as done but lost.
 func (s *session) handleSetstat(payload []byte) {
-	id, _, _ := unmarshalUint32(payload)
+	id, rest, err := unmarshalUint32(payload)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	path, rest, err := unmarshalString(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	attrs, _, err := parseAttrs(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+
+	full, err := s.g.resolvePath(path)
+	if err != nil {
+		s.sendStatus(id, sshFxPermissionDenied, "access denied")
+		return
+	}
+	if err := applyAttrs(attrs, full, nil); err != nil {
+		s.sendStatus(id, sshFxFailure, err.Error())
+		return
+	}
 	s.sendStatus(id, sshFxOk, "")
+}
+
+// handleFsetstat applies attributes to an open handle (SSH_FXP_FSETSTAT).
+func (s *session) handleFsetstat(payload []byte) {
+	id, rest, err := unmarshalUint32(payload)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	handle, rest, err := unmarshalString(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+	attrs, _, err := parseAttrs(rest)
+	if err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
+
+	s.mu.Lock()
+	entry := s.handles[handle]
+	s.mu.Unlock()
+	if entry == nil || entry.file == nil {
+		s.sendStatus(id, sshFxFailure, "invalid handle")
+		return
+	}
+	if err := applyAttrs(attrs, entry.path, entry.file); err != nil {
+		s.sendStatus(id, sshFxFailure, err.Error())
+		return
+	}
+	s.sendStatus(id, sshFxOk, "")
+}
+
+// applyAttrs applies the supported attribute changes to a file, identified
+// either by an open *os.File (f, preferred when set) or by path.
+func applyAttrs(a fileAttrs, path string, f *os.File) error {
+	if a.hasSize {
+		if f != nil {
+			if err := f.Truncate(int64(a.size)); err != nil {
+				return err
+			}
+		} else if err := os.Truncate(path, int64(a.size)); err != nil {
+			return err
+		}
+	}
+	if a.hasPerm {
+		mode := os.FileMode(a.perm & 0o777)
+		if f != nil {
+			if err := f.Chmod(mode); err != nil {
+				return err
+			}
+		} else if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
+	}
+	if a.hasTimes {
+		// *os.File has no Chtimes; times are always applied by path.
+		if err := os.Chtimes(path, time.Unix(int64(a.atime), 0), time.Unix(int64(a.mtime), 0)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *session) handleReadlink(payload []byte) {

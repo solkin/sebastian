@@ -174,6 +174,60 @@ func marshalAttrs(b []byte, fi os.FileInfo) []byte {
 	return b
 }
 
+// fileAttrs holds the subset of SFTP file attributes that we can apply to the
+// local filesystem. Ownership (uid/gid) is intentionally not represented.
+type fileAttrs struct {
+	hasSize  bool
+	size     uint64
+	hasPerm  bool
+	perm     uint32
+	hasTimes bool
+	atime    uint32
+	mtime    uint32
+}
+
+// parseAttrs decodes an SFTP attribute block, returning the values we support
+// and the remaining bytes. Unknown/uid-gid fields are skipped.
+func parseAttrs(b []byte) (fileAttrs, []byte, error) {
+	var a fileAttrs
+	flags, rest, err := unmarshalUint32(b)
+	if err != nil {
+		return a, nil, err
+	}
+	if flags&sshFileXferAttrSize != 0 {
+		a.size, rest, err = unmarshalUint64(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasSize = true
+	}
+	if flags&sshFileXferAttrUIDGID != 0 {
+		if len(rest) < 8 {
+			return a, nil, fmt.Errorf("short attrs")
+		}
+		rest = rest[8:] // ownership is not applied
+	}
+	if flags&sshFileXferAttrPermissions != 0 {
+		a.perm, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasPerm = true
+	}
+	if flags&sshFileXferAttrACModTime != 0 {
+		a.atime, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.mtime, rest, err = unmarshalUint32(rest)
+		if err != nil {
+			return a, nil, err
+		}
+		a.hasTimes = true
+	}
+	return a, rest, nil
+}
+
 // unmarshalAttrs skips over attributes in a packet (we don't use most of them).
 func unmarshalAttrs(b []byte) ([]byte, error) {
 	flags, rest, err := unmarshalUint32(b)
