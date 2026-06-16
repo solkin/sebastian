@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/solkin/sebastian/internal/gateway"
@@ -548,7 +549,11 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	prefix := r.URL.Query().Get("prefix")
 	delimiter := r.URL.Query().Get("delimiter")
 	marker := r.URL.Query().Get("marker")
-	maxKeys := parseMaxKeys(r)
+	maxKeys, ok := parseMaxKeys(r)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid max-keys value")
+		return
+	}
 
 	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
 	if err != nil {
@@ -582,7 +587,11 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	delimiter := r.URL.Query().Get("delimiter")
 	startAfter := r.URL.Query().Get("start-after")
 	contToken := r.URL.Query().Get("continuation-token")
-	maxKeys := parseMaxKeys(r)
+	maxKeys, ok := parseMaxKeys(r)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid max-keys value")
+		return
+	}
 
 	objects, cpList, err := g.collectObjects(bp, prefix, delimiter)
 	if err != nil {
@@ -618,19 +627,26 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	writeXML(w, http.StatusOK, result)
 }
 
-// parseMaxKeys extracts max-keys from query, defaulting to 1000.
-func parseMaxKeys(r *http.Request) int {
-	maxKeys := 1000
-	if s := r.URL.Query().Get("max-keys"); s != "" {
-		fmt.Sscanf(s, "%d", &maxKeys)
-		if maxKeys <= 0 {
-			maxKeys = 1000
-		}
-		if maxKeys > 10000 {
-			maxKeys = 10000
-		}
+// parseMaxKeys extracts max-keys from the query, defaulting to 1000. It returns
+// ok=false for a non-numeric value (e.g. "abc" or trailing garbage like "5x") so
+// the caller can reject it with InvalidArgument instead of silently using a
+// default or a partially-parsed number.
+func parseMaxKeys(r *http.Request) (int, bool) {
+	s := r.URL.Query().Get("max-keys")
+	if s == "" {
+		return 1000, true
 	}
-	return maxKeys
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	if n <= 0 {
+		n = 1000
+	}
+	if n > 10000 {
+		n = 10000
+	}
+	return n, true
 }
 
 // handleHeadObject returns metadata for an object.
