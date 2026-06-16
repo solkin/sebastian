@@ -30,6 +30,10 @@ const (
 	presignSkewGrace = 15 * time.Minute
 )
 
+// nowUTC returns the current time in UTC. It is a variable so tests can pin the
+// clock when validating fixed-date example signatures.
+var nowUTC = func() time.Time { return time.Now().UTC() }
+
 // credential holds the parsed components of an AWS credential scope.
 type credential struct {
 	accessKey string
@@ -74,13 +78,26 @@ func verifyHeaderV4(r *http.Request, accessKey, secretKey string) bool {
 		return false
 	}
 
+	// A header-form signature carries no explicit expiry, so without a clock-skew
+	// window a captured Authorization header would replay forever. Bound it.
+	if !withinSkew(amzDate) {
+		return false
+	}
+
+	signedHeaders := splitSignedHeaders(signedHeadersRaw)
+	// host must be signed, otherwise the signature is not bound to the target host
+	// (and thus, with virtual-hosted addressing, not bound to a bucket).
+	if !containsHeader(signedHeaders, "host") {
+		return false
+	}
+
 	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
 		payloadHash = unsignedPayload
 	}
 
 	expected := computeSignature(r, secretKey, cred, amzDate,
-		splitSignedHeaders(signedHeadersRaw),
+		signedHeaders,
 		canonicalQueryString(r.URL.Query(), ""), payloadHash)
 
 	return hmac.Equal([]byte(expected), []byte(providedSig))
@@ -108,8 +125,14 @@ func verifyPresignedV4(r *http.Request, accessKey, secretKey string) bool {
 		return false
 	}
 
+	signedHeaders := splitSignedHeaders(signedHeadersRaw)
+	// host must be signed so the presigned URL is bound to the target host/bucket.
+	if !containsHeader(signedHeaders, "host") {
+		return false
+	}
+
 	expected := computeSignature(r, secretKey, cred, amzDate,
-		splitSignedHeaders(signedHeadersRaw),
+		signedHeaders,
 		canonicalQueryString(q, "X-Amz-Signature"), unsignedPayload)
 
 	return hmac.Equal([]byte(expected), []byte(providedSig))
@@ -252,11 +275,36 @@ func presignedNotExpired(amzDate, expiresStr string) bool {
 	if err != nil || expires <= 0 {
 		return false
 	}
-	now := time.Now().UTC()
+	now := nowUTC()
 	if now.Before(t.Add(-presignSkewGrace)) {
 		return false
 	}
 	return !now.After(t.Add(time.Duration(expires) * time.Second))
+}
+
+// withinSkew reports whether amzDate (an X-Amz-Date stamp) is within
+// presignSkewGrace of the current time, in either direction. This bounds replay
+// of header-form signatures, which carry no explicit expiry of their own.
+func withinSkew(amzDate string) bool {
+	t, err := time.Parse(amzDateFormat, amzDate)
+	if err != nil {
+		return false
+	}
+	delta := nowUTC().Sub(t)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= presignSkewGrace
+}
+
+// containsHeader reports whether name appears in the (lowercased) signed-headers list.
+func containsHeader(signed []string, name string) bool {
+	for _, h := range signed {
+		if h == name {
+			return true
+		}
+	}
+	return false
 }
 
 // deriveSigningKey computes the SigV4 signing key from the secret access key.

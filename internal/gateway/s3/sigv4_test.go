@@ -21,6 +21,12 @@ func TestSigV4_KnownAnswer(t *testing.T) {
 		wantSig   = "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
 	)
 
+	// The example carries a fixed 2013 date; pin the clock so the skew check in
+	// verifyHeaderV4 accepts it.
+	restore := nowUTC
+	nowUTC = func() time.Time { return time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC) }
+	defer func() { nowUTC = restore }()
+
 	req := httptest.NewRequest(http.MethodGet, "https://examplebucket.s3.amazonaws.com/test.txt", nil)
 	req.Host = "examplebucket.s3.amazonaws.com"
 	req.Header.Set("Range", "bytes=0-9")
@@ -41,29 +47,30 @@ func TestSigV4_KnownAnswer(t *testing.T) {
 
 // --- Signing helpers shared by the auth tests ---
 
-const (
-	testAmzDate = "20260101T000000Z"
-	testDate    = "20260101"
-	testScope   = testDate + "/us-east-1/s3/aws4_request"
-)
-
 // signV4Header signs req in place with a valid SigV4 Authorization header over
-// host;x-amz-content-sha256;x-amz-date. req.Host must already be set. It reuses
-// the production signer, so a passing TestSigV4_KnownAnswer anchors correctness.
+// host;x-amz-content-sha256;x-amz-date. req.Host must already be set. It signs
+// with the current time so the signature falls within the enforced skew window,
+// and reuses the production signer, so a passing TestSigV4_KnownAnswer anchors
+// correctness.
 func signV4Header(req *http.Request, accessKey, secretKey string) {
-	req.Header.Set("X-Amz-Date", testAmzDate)
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	date := now.Format("20060102")
+	scope := date + "/us-east-1/s3/aws4_request"
+
+	req.Header.Set("X-Amz-Date", amzDate)
 	if req.Header.Get("X-Amz-Content-Sha256") == "" {
 		req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
 	}
 	signed := []string{"host", "x-amz-content-sha256", "x-amz-date"}
 	sort.Strings(signed)
 
-	cred := credential{accessKey: accessKey, date: testDate, region: "us-east-1", service: "s3", scope: testScope}
-	sig := computeSignature(req, secretKey, cred, testAmzDate, signed,
+	cred := credential{accessKey: accessKey, date: date, region: "us-east-1", service: "s3", scope: scope}
+	sig := computeSignature(req, secretKey, cred, amzDate, signed,
 		canonicalQueryString(req.URL.Query(), ""), req.Header.Get("X-Amz-Content-Sha256"))
 
 	req.Header.Set("Authorization", sigV4Algorithm+
-		" Credential="+accessKey+"/"+testScope+
+		" Credential="+accessKey+"/"+scope+
 		", SignedHeaders="+strings.Join(signed, ";")+
 		", Signature="+sig)
 }
