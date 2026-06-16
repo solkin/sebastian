@@ -420,6 +420,9 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 
 	err := filepath.Walk(bp, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
+			// Skip an unreadable entry but log it: silently dropping it would make
+			// objects beneath it vanish from the listing with no signal.
+			g.logger.Warn("list objects: skipping unreadable entry", "path", path, "error", err)
 			return nil
 		}
 		if path == bp {

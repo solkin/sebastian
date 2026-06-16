@@ -11,7 +11,7 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 - **SFTP** — SSH File Transfer Protocol v3, compatible with OpenSSH sftp, FileZilla, WinSCP
 - **HTTP UI** — Material 3 styled web file browser with upload, download, rename, delete, drag-and-drop folder upload
 - **Atomic writes** — all file writes use temp file + rename for consistency
-- **Path traversal protection** — two-layer defense (textual check + absolute path verification)
+- **Path traversal protection** — three-layer defense (textual check + absolute path verification + symlink-escape resolution), applied uniformly across all gateways
 
 ## Quick Start
 
