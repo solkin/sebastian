@@ -339,16 +339,12 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if dstExists {
-		os.RemoveAll(dstFull)
-	}
-
 	if err := os.MkdirAll(filepath.Dir(dstFull), 0o755); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	if err := os.Rename(srcFull, dstFull); err != nil {
+	if err := stageReplace(dstFull, func() error { return os.Rename(srcFull, dstFull) }); err != nil {
 		g.logger.Error("move failed", "from", srcRel, "to", dstRel, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -402,27 +398,21 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if dstExists {
-		os.RemoveAll(dstFull)
-	}
-
 	if err := os.MkdirAll(filepath.Dir(dstFull), 0o755); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	if srcInfo.IsDir() {
-		if err := copyDir(srcFull, dstFull); err != nil {
-			g.logger.Error("copy dir failed", "from", srcRel, "to", dstRel, "error", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
+	copyErr := stageReplace(dstFull, func() error {
+		if srcInfo.IsDir() {
+			return copyDir(srcFull, dstFull)
 		}
-	} else {
-		if err := copyFile(srcFull, dstFull); err != nil {
-			g.logger.Error("copy file failed", "from", srcRel, "to", dstRel, "error", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
+		return copyFile(srcFull, dstFull)
+	})
+	if copyErr != nil {
+		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", copyErr)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 
 	g.logger.Info("copied", "from", srcRel, "to", dstRel)
@@ -591,6 +581,14 @@ func copyDir(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
+		// Never follow symlinks discovered during recursion: dereferencing one
+		// could copy the contents of a file outside rootDir into the destination.
+		// The request/Destination paths are symlink-checked by the caller, but
+		// entries found via ReadDir are not, so skip any link here.
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+
 		if entry.IsDir() {
 			if err := copyDir(srcPath, dstPath); err != nil {
 				return err
@@ -603,4 +601,48 @@ func copyDir(src, dst string) error {
 	}
 
 	return nil
+}
+
+// stageReplace runs op, which must create dst, without destroying a pre-existing
+// dst until op succeeds. If dst exists it is first moved aside to a temporary
+// sibling; on success the backup is removed, and on failure the partial result
+// is discarded and the original restored. This keeps overwrite non-destructive
+// even when op fails partway (e.g. a cross-device rename or a mid-tree copy error).
+func stageReplace(dst string, op func() error) error {
+	if _, err := os.Lstat(dst); err != nil {
+		// dst does not exist — nothing to preserve, run op directly.
+		return op()
+	}
+
+	backup, err := reserveSiblingName(dst)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(dst, backup); err != nil {
+		return err
+	}
+
+	if err := op(); err != nil {
+		os.RemoveAll(dst)      // discard any partial result
+		os.Rename(backup, dst) // restore the original
+		return err
+	}
+
+	os.RemoveAll(backup)
+	return nil
+}
+
+// reserveSiblingName returns an unused path in dst's directory suitable for a
+// temporary backup, by briefly creating and removing a temp file to claim a name.
+func reserveSiblingName(dst string) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(dst), ".seb-bak-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	f.Close()
+	if err := os.Remove(name); err != nil {
+		return "", err
+	}
+	return name, nil
 }
