@@ -50,9 +50,18 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 		closed:  make(chan struct{}),
 	}
 
-	sshCfg := &ssh.ServerConfig{}
+	sshCfg := &ssh.ServerConfig{
+		// Pin the per-connection password-attempt cap rather than relying on the
+		// library default, to blunt online guessing.
+		MaxAuthTries: 6,
+	}
 
-	if cfg.Username != "" && cfg.Password != "" {
+	// Authentication is required whenever a username OR password is configured.
+	// Using "||" (not "&&") keeps a half-filled config fail-closed: a config that
+	// sets only one field must still match it, instead of silently accepting every
+	// client. Only an entirely empty credential disables auth (the documented
+	// no-auth mode, consistent with the HTTP/WebDAV gateways).
+	if cfg.Username != "" || cfg.Password != "" {
 		sshCfg.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			userOK := subtle.ConstantTimeCompare([]byte(conn.User()), []byte(cfg.Username))
 			passOK := subtle.ConstantTimeCompare(password, []byte(cfg.Password))
