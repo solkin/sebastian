@@ -17,14 +17,20 @@ import (
 
 func newTestGateway(t *testing.T, username, password string) (*Gateway, string) {
 	t.Helper()
+	return newTestGatewayWithConfig(t, Config{
+		Username: username,
+		Password: password,
+	})
+}
+
+func newTestGatewayWithConfig(t *testing.T, cfg Config) (*Gateway, string) {
+	t.Helper()
 	dir := t.TempDir()
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":0"
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	g := New(dir, Config{
-		ListenAddr: ":0",
-		Username:   username,
-		Password:   password,
-	}, logger)
-	return g, dir
+	return New(dir, cfg, logger), dir
 }
 
 func serve(g *Gateway, method, path string, body io.Reader, auth func(r *http.Request)) *httptest.ResponseRecorder {
@@ -473,6 +479,65 @@ func TestUploadTraversalInFilename(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for path traversal in filename, got %d", w.Code)
+	}
+}
+
+func TestUploadRejectsSymlinkEscapeInRelativePath(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dir, "escape")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	body, ct := createMultipartUpload("", "escape/evil.txt", "bad")
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for symlink escape upload, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outside, "evil.txt")); !os.IsNotExist(err) {
+		t.Fatal("upload must not create a file outside root through a symlink")
+	}
+}
+
+func TestUploadRejectsSymlinkEscapeInTargetPath(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dir, "escape")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	body, ct := createMultipartUpload("escape", "evil.txt", "bad")
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for symlink escape target path, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(outside, "evil.txt")); !os.IsNotExist(err) {
+		t.Fatal("upload must not create a file outside root through target path symlink")
+	}
+}
+
+func TestUploadMaxBytesLimit(t *testing.T) {
+	g, dir := newTestGatewayWithConfig(t, Config{MaxUploadBytes: 64})
+
+	body, ct := createMultipartUpload("", "large.txt", strings.Repeat("x", 1024))
+	req := httptest.NewRequest(http.MethodPost, "/_api/upload", body)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	g.server.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for over-limit upload, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "large.txt")); !os.IsNotExist(err) {
+		t.Fatal("over-limit upload must not create the file")
 	}
 }
 

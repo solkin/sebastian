@@ -705,13 +705,21 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	f, err := os.Open(op)
+	if err != nil {
+		g.logger.Error("get object: open failed", "bucket", bucket, "key", key, "error", err)
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
+	defer f.Close()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
 	w.Header().Set("ETag", etagFor(info))
 
 	g.logger.Debug("get object", "bucket", bucket, "key", key, "size", info.Size())
-	http.ServeFile(w, r, op)
+	http.ServeContent(w, r, filepath.Base(op), info.ModTime(), f)
 }
 
 // handlePutObject writes an object to the bucket.

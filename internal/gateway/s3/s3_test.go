@@ -341,6 +341,39 @@ func TestPutObject_NestedKey(t *testing.T) {
 	}
 }
 
+func TestPutObject_MaxUploadBytesPreservesExisting(t *testing.T) {
+	g, syncDir := testGateway(t, Config{MaxUploadBytes: 4})
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(bp, "f.txt")
+	if err := os.WriteFile(objectPath, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := serveRequest(g, http.MethodPut, "/mybucket/f.txt", strings.NewReader("too large"), noAuth())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for over-limit PUT, got %d: %s", w.Code, w.Body.String())
+	}
+	data, err := os.ReadFile(objectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("existing object should be preserved, got %q", data)
+	}
+	entries, err := os.ReadDir(bp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".seb-tmp-") {
+			t.Fatalf("temporary file was not cleaned up: %s", entry.Name())
+		}
+	}
+}
+
 func TestPutObject_NoBucket(t *testing.T) {
 	g, _ := testGateway(t, Config{})
 
@@ -357,6 +390,59 @@ func TestGetObject_NotExists(t *testing.T) {
 	w := serveRequest(g, http.MethodGet, "/mybucket/nonexistent.txt", nil, noAuth())
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestGetObject_IndexHTMLServedWithoutRedirect(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bp, "index.html"), []byte("<h1>ok</h1>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := serveRequest(g, http.MethodGet, "/mybucket/index.html", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; Location=%q body=%q", w.Code, w.Header().Get("Location"), w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "" {
+		t.Fatalf("expected no redirect Location header, got %q", loc)
+	}
+	if w.Body.String() != "<h1>ok</h1>" {
+		t.Fatalf("unexpected body: %q", w.Body.String())
+	}
+}
+
+func TestGetObject_OpenFailureAfterStat(t *testing.T) {
+	syncDir, err := os.MkdirTemp("/tmp", "sebastian-s3-*")
+	if err != nil {
+		t.Skipf("short temp dir unavailable: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(syncDir) })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := New(syncDir, Config{}, logger)
+
+	bp := filepath.Join(syncDir, "mybucket")
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	socketPath := filepath.Join(bp, "not-a-regular-file")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Skipf("unix sockets unsupported: %v", err)
+	}
+	defer ln.Close()
+
+	w := serveRequest(g, http.MethodGet, "/mybucket/not-a-regular-file", nil, noAuth())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for open failure, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Content-Length") != "" {
+		t.Fatalf("error response must not keep object Content-Length, got %q", w.Header().Get("Content-Length"))
 	}
 }
 

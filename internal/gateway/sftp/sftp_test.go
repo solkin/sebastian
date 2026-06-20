@@ -109,10 +109,10 @@ type sshPipe struct {
 	r io.Reader
 }
 
-func (p *sshPipe) Read(data []byte) (int, error)         { return p.r.Read(data) }
-func (p *sshPipe) Write(data []byte) (int, error)        { return p.w.Write(data) }
-func (p *sshPipe) Close() error                          { return p.w.Close() }
-func (p *sshPipe) CloseWrite() error                     { return p.w.Close() }
+func (p *sshPipe) Read(data []byte) (int, error)  { return p.r.Read(data) }
+func (p *sshPipe) Write(data []byte) (int, error) { return p.w.Write(data) }
+func (p *sshPipe) Close() error                   { return p.w.Close() }
+func (p *sshPipe) CloseWrite() error              { return p.w.Close() }
 func (p *sshPipe) SendRequest(string, bool, []byte) (bool, error) {
 	return false, fmt.Errorf("not supported")
 }
@@ -327,6 +327,20 @@ func sftpClose(t *testing.T, ch io.ReadWriter, id uint32, handle string) {
 	if code != sshFxOk {
 		t.Fatalf("close failed: %d", code)
 	}
+}
+
+func readStatusCode(t *testing.T, ch io.Reader) uint32 {
+	t.Helper()
+	pktType, payload, err := readPacket(ch)
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if pktType != sshFxpStatus {
+		t.Fatalf("expected STATUS, got %d", pktType)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	code, _, _ := unmarshalUint32(rest)
+	return code
 }
 
 // sftpMkdir creates a directory.
@@ -1084,6 +1098,77 @@ func TestSetstat(t *testing.T) {
 	}
 }
 
+func TestSetstatAppliesAttrs(t *testing.T) {
+	syncDir := t.TempDir()
+	path := filepath.Join(syncDir, "f.txt")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "/f.txt")
+	req = marshalUint32(req, sshFileXferAttrSize|sshFileXferAttrPermissions|sshFileXferAttrACModTime)
+	req = marshalUint64(req, 3)
+	req = marshalUint32(req, 0o600)
+	req = marshalUint32(req, 123)
+	req = marshalUint32(req, 456)
+	writePacket(ch, sshFxpSetstat, req)
+
+	if code := readStatusCode(t, ch); code != sshFxOk {
+		t.Fatalf("expected OK for setstat, got %d", code)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 3 || info.Mode().Perm() != 0o600 || info.ModTime().Unix() != 456 {
+		t.Fatalf("attrs not applied: size=%d mode=%o mtime=%d", info.Size(), info.Mode().Perm(), info.ModTime().Unix())
+	}
+}
+
+func TestSetstatTraversal(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "../../../etc/passwd")
+	req = marshalUint32(req, 0)
+	writePacket(ch, sshFxpSetstat, req)
+
+	if code := readStatusCode(t, ch); code != sshFxPermissionDenied {
+		t.Fatalf("expected permission denied for traversal setstat, got %d", code)
+	}
+}
+
+func TestSetstatBadAttrs(t *testing.T) {
+	syncDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(syncDir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "/f.txt")
+	req = append(req, 0, 0) // too short for attrs flags
+	writePacket(ch, sshFxpSetstat, req)
+
+	if code := readStatusCode(t, ch); code != sshFxBadMessage {
+		t.Fatalf("expected bad message for malformed setstat attrs, got %d", code)
+	}
+}
+
 func TestFsetstat(t *testing.T) {
 	syncDir := t.TempDir()
 	os.WriteFile(filepath.Join(syncDir, "f.txt"), []byte("x"), 0o644)
@@ -1110,6 +1195,148 @@ func TestFsetstat(t *testing.T) {
 		t.Errorf("expected OK for fsetstat, got %d", code)
 	}
 	sftpClose(t, ch, 3, handle)
+}
+
+func TestFsetstatInvalidHandle(t *testing.T) {
+	syncDir := t.TempDir()
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "missing-handle")
+	req = marshalUint32(req, 0)
+	writePacket(ch, sshFxpFsetstat, req)
+
+	if code := readStatusCode(t, ch); code != sshFxFailure {
+		t.Fatalf("expected failure for invalid fsetstat handle, got %d", code)
+	}
+}
+
+func TestFsetstatAppliesAttrs(t *testing.T) {
+	syncDir := t.TempDir()
+	path := filepath.Join(syncDir, "f.txt")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpenFile(t, ch, 1, "/f.txt", sshFxfRead|sshFxfWrite)
+
+	var req []byte
+	req = marshalUint32(req, 2)
+	req = marshalString(req, handle)
+	req = marshalUint32(req, sshFileXferAttrSize|sshFileXferAttrPermissions)
+	req = marshalUint64(req, 2)
+	req = marshalUint32(req, 0o640)
+	writePacket(ch, sshFxpFsetstat, req)
+
+	if code := readStatusCode(t, ch); code != sshFxOk {
+		t.Fatalf("expected OK for fsetstat, got %d", code)
+	}
+	sftpClose(t, ch, 3, handle)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 2 || info.Mode().Perm() != 0o640 {
+		t.Fatalf("attrs not applied: size=%d mode=%o", info.Size(), info.Mode().Perm())
+	}
+}
+
+func TestParseAttrsAllSupportedFields(t *testing.T) {
+	var req []byte
+	req = marshalUint32(req, sshFileXferAttrSize|sshFileXferAttrUIDGID|sshFileXferAttrPermissions|sshFileXferAttrACModTime)
+	req = marshalUint64(req, 42)
+	req = marshalUint32(req, 1000) // uid, ignored
+	req = marshalUint32(req, 1001) // gid, ignored
+	req = marshalUint32(req, 0o640)
+	req = marshalUint32(req, 111)
+	req = marshalUint32(req, 222)
+	req = append(req, 0xaa, 0xbb)
+
+	attrs, rest, err := parseAttrs(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !attrs.hasSize || attrs.size != 42 {
+		t.Fatalf("unexpected size attrs: %+v", attrs)
+	}
+	if !attrs.hasPerm || attrs.perm != 0o640 {
+		t.Fatalf("unexpected permission attrs: %+v", attrs)
+	}
+	if !attrs.hasTimes || attrs.atime != 111 || attrs.mtime != 222 {
+		t.Fatalf("unexpected time attrs: %+v", attrs)
+	}
+	if len(rest) != 2 || rest[0] != 0xaa || rest[1] != 0xbb {
+		t.Fatalf("unexpected remaining bytes: %x", rest)
+	}
+}
+
+func TestParseAttrsShortUIDGID(t *testing.T) {
+	var req []byte
+	req = marshalUint32(req, sshFileXferAttrUIDGID)
+	req = append(req, 1, 2, 3)
+
+	if _, _, err := parseAttrs(req); err == nil {
+		t.Fatal("expected short uid/gid attrs to fail")
+	}
+}
+
+func TestApplyAttrsPathAndFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(p, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pathAttrs := fileAttrs{
+		hasSize:  true,
+		size:     2,
+		hasPerm:  true,
+		perm:     0o600,
+		hasTimes: true,
+		atime:    123,
+		mtime:    456,
+	}
+	if err := applyAttrs(pathAttrs, p, nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 2 || info.Mode().Perm() != 0o600 || info.ModTime().Unix() != 456 {
+		t.Fatalf("path attrs not applied: size=%d mode=%o mtime=%d", info.Size(), info.Mode().Perm(), info.ModTime().Unix())
+	}
+
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	openFileAttrs := fileAttrs{
+		hasSize: true,
+		size:    1,
+		hasPerm: true,
+		perm:    0o640,
+	}
+	if err := applyAttrs(openFileAttrs, p, f); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 1 || info.Mode().Perm() != 0o640 {
+		t.Fatalf("file attrs not applied: size=%d mode=%o", info.Size(), info.Mode().Perm())
+	}
 }
 
 // --- Readlink / Symlink ---

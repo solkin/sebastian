@@ -16,13 +16,20 @@ import (
 // newTestGateway creates a Gateway with a temporary rootDir and httptest server.
 func newTestGateway(t *testing.T, username, password string) (*Gateway, *httptest.Server) {
 	t.Helper()
+	return newTestGatewayWithConfig(t, Config{
+		Username: username,
+		Password: password,
+	})
+}
+
+func newTestGatewayWithConfig(t *testing.T, cfg Config) (*Gateway, *httptest.Server) {
+	t.Helper()
 	rootDir := t.TempDir()
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":0"
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	g := New(rootDir, Config{
-		ListenAddr: ":0",
-		Username:   username,
-		Password:   password,
-	}, logger)
+	g := New(rootDir, cfg, logger)
 	ts := httptest.NewServer(g.server.Handler)
 	t.Cleanup(ts.Close)
 	return g, ts
@@ -908,6 +915,36 @@ func TestPut_OverwriteExisting(t *testing.T) {
 	}
 }
 
+func TestPut_MaxUploadBytesPreservesExisting(t *testing.T) {
+	g, ts := newTestGatewayWithConfig(t, Config{MaxUploadBytes: 4})
+	path := filepath.Join(g.rootDir, "f.txt")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doReq(t, http.MethodPut, ts.URL+"/f.txt", "too large", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for over-limit PUT, got %d", resp.StatusCode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("existing file should be preserved, got %q", data)
+	}
+	entries, err := os.ReadDir(g.rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".seb-tmp-") {
+			t.Fatalf("temporary file was not cleaned up: %s", entry.Name())
+		}
+	}
+}
+
 // --- DELETE edge cases ---
 
 func TestDelete_Traversal(t *testing.T) {
@@ -942,6 +979,38 @@ func TestDelete_DirectoryRecursive(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(g.rootDir, "dir")); !os.IsNotExist(err) {
 		t.Fatal("directory should be removed")
+	}
+}
+
+func TestStageReplace_RestoresOriginalOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := stageReplace(dst, func() error {
+		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+			return err
+		}
+		return fmt.Errorf("boom")
+	})
+	if err == nil {
+		t.Fatal("expected stageReplace to return the operation error")
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("expected original content restored, got %q", data)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target.txt" {
+		t.Fatalf("expected only restored target, got %v", entries)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -205,8 +206,6 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	relpaths := r.MultipartForm.Value["relpaths"]
 
-	absSync, _ := filepath.Abs(g.rootDir)
-
 	for i, fh := range files {
 		name := fh.Filename
 		if i < len(relpaths) && relpaths[i] != "" {
@@ -220,9 +219,8 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		destPath := filepath.Join(dirFullPath, filepath.FromSlash(cleanName))
-		absDest, _ := filepath.Abs(destPath)
-		if !strings.HasPrefix(absDest, absSync+string(filepath.Separator)) {
+		destPath, err := g.resolvePath(path.Join(targetDir, cleanName))
+		if err != nil {
 			jsonError(w, http.StatusBadRequest, "invalid file name")
 			return
 		}
@@ -230,6 +228,11 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 		destDir := filepath.Dir(destPath)
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			jsonError(w, http.StatusInternalServerError, "failed to create directory")
+			return
+		}
+		destPath, err = g.resolvePath(path.Join(targetDir, cleanName))
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid file name")
 			return
 		}
 
