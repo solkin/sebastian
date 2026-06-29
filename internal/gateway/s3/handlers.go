@@ -184,6 +184,14 @@ func validateKey(key string) bool {
 	if key == "" {
 		return false
 	}
+	// Reject any ".." path segment outright rather than letting filepath.Clean
+	// collapse it: a key like "a/../b" must not be silently rewritten to "b"
+	// (AWS treats keys literally), and the traversal intent is refused either way.
+	for _, seg := range strings.Split(filepath.ToSlash(key), "/") {
+		if seg == ".." {
+			return false
+		}
+	}
 	cleaned := filepath.ToSlash(filepath.Clean(key))
 	if strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || cleaned == ".." {
 		return false
@@ -874,12 +882,17 @@ func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	if err := os.Remove(op); err != nil && !os.IsNotExist(err) {
-		g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
-		return
+	// Only a regular file is an object. Deleting a missing key is a success no-op
+	// in S3, and a key that resolves to a directory must not be removed via the
+	// object API (os.Remove on a non-empty directory would otherwise return 500).
+	if info, err := os.Stat(op); err == nil && !info.IsDir() {
+		if rmErr := os.Remove(op); rmErr != nil && !os.IsNotExist(rmErr) {
+			g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", rmErr)
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
+			return
+		}
+		g.logger.Info("object deleted", "bucket", bucket, "key", key)
 	}
 
-	g.logger.Info("object deleted", "bucket", bucket, "key", key)
 	w.WriteHeader(http.StatusNoContent)
 }

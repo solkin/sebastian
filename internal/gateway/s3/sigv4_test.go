@@ -45,6 +45,23 @@ func TestSigV4_KnownAnswer(t *testing.T) {
 	}
 }
 
+// TestCanonicalHeaders_ContentLength verifies that a signed content-length header
+// is reconstructed from r.ContentLength (which net/http hoists out of r.Header),
+// so SDKs that sign content-length still canonicalize correctly.
+func TestCanonicalHeaders_ContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "https://b.example.com/key", strings.NewReader("12345"))
+	req.Host = "b.example.com"
+	if req.Header.Get("Content-Length") != "" {
+		t.Fatal("precondition: net/http should not expose Content-Length via Header")
+	}
+
+	got := canonicalHeaders(req, []string{"content-length", "host"})
+	want := "content-length:5\nhost:b.example.com\n"
+	if got != want {
+		t.Fatalf("canonicalHeaders content-length:\n got %q\nwant %q", got, want)
+	}
+}
+
 // --- Signing helpers shared by the auth tests ---
 
 // signV4Header signs req in place with a valid SigV4 Authorization header over

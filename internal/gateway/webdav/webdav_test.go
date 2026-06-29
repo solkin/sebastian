@@ -436,6 +436,21 @@ func TestMove_NoOverwrite(t *testing.T) {
 	}
 }
 
+func TestMove_InvalidOverwrite(t *testing.T) {
+	g, ts := newTestGateway(t, "", "")
+	os.WriteFile(filepath.Join(g.rootDir, "src.txt"), []byte("data"), 0o644)
+
+	resp := doReq(t, "MOVE", ts.URL+"/src.txt", "", map[string]string{
+		"Destination": ts.URL + "/dst.txt",
+		"Overwrite":   "yes", // not T/F
+	})
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed Overwrite, got %d", resp.StatusCode)
+	}
+}
+
 func TestCopy(t *testing.T) {
 	g, ts := newTestGateway(t, "", "")
 
@@ -812,8 +827,8 @@ func TestCopy_MissingDestination(t *testing.T) {
 
 	resp := doReq(t, "COPY", ts.URL+"/src.txt", "", nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected 502 for missing Destination, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing Destination, got %d", resp.StatusCode)
 	}
 }
 
@@ -1082,8 +1097,8 @@ func TestMove_MissingDestination(t *testing.T) {
 
 	resp := doReq(t, "MOVE", ts.URL+"/src.txt", "", nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected 502 for missing Destination, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing Destination, got %d", resp.StatusCode)
 	}
 }
 

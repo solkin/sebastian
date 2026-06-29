@@ -70,6 +70,12 @@ const (
 
 const sftpProtocolVersion = 3
 
+// maxPacketSize bounds a single inbound SFTP packet. It must hold the largest
+// legitimate WRITE (file chunk plus handle/offset overhead); 512 KiB comfortably
+// fits the 256 KiB chunks used by aggressive clients while capping per-packet
+// allocation far below the previous 16 MiB.
+const maxPacketSize = 512 * 1024
+
 // readPacket reads a single SFTP packet: 4-byte length + payload.
 func readPacket(r io.Reader) (byte, []byte, error) {
 	var lenBuf [4]byte
@@ -77,7 +83,7 @@ func readPacket(r io.Reader) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	length := binary.BigEndian.Uint32(lenBuf[:])
-	if length == 0 || length > 1<<24 {
+	if length == 0 || length > maxPacketSize {
 		return 0, nil, fmt.Errorf("invalid packet length: %d", length)
 	}
 

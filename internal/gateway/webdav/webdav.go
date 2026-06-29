@@ -5,6 +5,7 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,13 @@ import (
 	"time"
 
 	"github.com/solkin/sebastian/internal/gateway"
+)
+
+// Destination-header error sentinels, so MOVE/COPY can map a missing or malformed
+// Destination to 400 and a forbidden target to 403 (rather than a blanket 502).
+var (
+	errMissingDestination = errors.New("missing Destination header")
+	errBadDestination     = errors.New("invalid Destination header")
 )
 
 // Config holds WebDAV gateway configuration.
@@ -149,12 +157,12 @@ func (g *Gateway) lockBlocked(w http.ResponseWriter, r *http.Request, relPath st
 func (g *Gateway) resolveDestination(r *http.Request) (string, string, error) {
 	dest := r.Header.Get("Destination")
 	if dest == "" {
-		return "", "", fmt.Errorf("missing Destination header")
+		return "", "", errMissingDestination
 	}
 
 	u, err := url.Parse(dest)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid Destination URL: %w", err)
+		return "", "", errBadDestination
 	}
 
 	return gateway.SafePath(g.rootDir, u.Path)

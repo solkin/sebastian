@@ -5,11 +5,34 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 )
+
+// SweepTempFiles removes stale atomic-write scratch files (".seb-tmp-*" and
+// ".seb-bak-*") left under rootDir by a previous process that died between
+// creating a temp file and renaming it into place. It is safe to call once at
+// startup, when no uploads are in flight.
+func SweepTempFiles(rootDir string, logger *slog.Logger) {
+	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, ".seb-tmp-") || strings.HasPrefix(name, ".seb-bak-") {
+			if rmErr := os.Remove(path); rmErr != nil {
+				logger.Warn("failed to remove stale temp file", "path", path, "error", rmErr)
+			} else {
+				logger.Info("removed stale temp file", "path", path)
+			}
+		}
+		return nil
+	})
+}
 
 // Gateway is an interface that each protocol-specific file access server must implement.
 type Gateway interface {

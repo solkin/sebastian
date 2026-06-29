@@ -203,9 +203,15 @@ func canonicalHeaders(r *http.Request, signedHeaders []string) string {
 	for _, h := range signedHeaders {
 		b.WriteString(h)
 		b.WriteByte(':')
-		if h == "host" {
+		switch {
+		case h == "host":
 			b.WriteString(trimAll(r.Host))
-		} else {
+		case h == "content-length" && r.ContentLength >= 0:
+			// net/http hoists Content-Length out of r.Header into r.ContentLength,
+			// so r.Header.Values would be empty and break a signature that signed
+			// content-length. Reconstruct it from the parsed value.
+			b.WriteString(strconv.FormatInt(r.ContentLength, 10))
+		default:
 			b.WriteString(trimAll(strings.Join(r.Header.Values(http.CanonicalHeaderKey(h)), ",")))
 		}
 		b.WriteByte('\n')

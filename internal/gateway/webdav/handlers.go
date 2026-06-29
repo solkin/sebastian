@@ -321,8 +321,10 @@ func (g *Gateway) handleMkcol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MKCOL with a request body is unsupported (RFC 4918 §9.3).
-	if r.ContentLength > 0 {
+	// MKCOL with a request body is unsupported (RFC 4918 §9.3). Peek for any body
+	// byte so chunked requests (ContentLength == -1) are rejected too.
+	probe := make([]byte, 1)
+	if n, _ := r.Body.Read(probe); n > 0 {
 		http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -357,8 +359,18 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dstRel, dstFull, err := g.resolveDestination(r)
+	if errors.Is(err, errMissingDestination) || errors.Is(err, errBadDestination) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
 	if err != nil || dstRel == "" {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	overwrite, ok := parseOverwrite(r.Header.Get("Overwrite"))
+	if !ok {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
@@ -379,7 +391,6 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, statErr := os.Stat(dstFull)
-	overwrite := r.Header.Get("Overwrite") != "F"
 	dstExists := statErr == nil
 
 	if dstExists && !overwrite {
@@ -415,8 +426,18 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dstRel, dstFull, err := g.resolveDestination(r)
+	if errors.Is(err, errMissingDestination) || errors.Is(err, errBadDestination) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
 	if err != nil || dstRel == "" {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	overwrite, ok := parseOverwrite(r.Header.Get("Overwrite"))
+	if !ok {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
@@ -443,7 +464,6 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, statErr := os.Stat(dstFull)
-	overwrite := r.Header.Get("Overwrite") != "F"
 	dstExists := statErr == nil
 
 	if dstExists && !overwrite {
@@ -611,6 +631,19 @@ func xmlEscapeString(s string) string {
 	var b strings.Builder
 	xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+// parseOverwrite interprets the WebDAV Overwrite header (RFC 4918 §10.6): absent
+// or "T" means overwrite, "F" means do not, anything else is malformed.
+func parseOverwrite(h string) (overwrite bool, ok bool) {
+	switch h {
+	case "", "T":
+		return true, true
+	case "F":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // isSameOrUnder reports whether path is dir itself or lies within dir's subtree.

@@ -39,6 +39,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Clear scratch files left by a previous crash before serving any requests.
+	gateway.SweepTempFiles(cfg.RootDir, logger)
+
 	logger.Info("sebastian starting",
 		"root_dir", cfg.RootDir,
 		"s3", cfg.Gateways.S3.Enabled,
