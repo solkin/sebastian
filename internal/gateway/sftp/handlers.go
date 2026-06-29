@@ -332,7 +332,10 @@ func (s *session) handleOpen(payload []byte) {
 		s.sendStatus(id, sshFxBadMessage, "bad message")
 		return
 	}
-	_, _ = unmarshalAttrs(rest)
+	if _, err := unmarshalAttrs(rest); err != nil {
+		s.sendStatus(id, sshFxBadMessage, "bad message")
+		return
+	}
 
 	fullPath, err := s.g.resolvePath(path)
 	if err != nil {

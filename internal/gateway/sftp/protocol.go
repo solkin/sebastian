@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 )
@@ -174,10 +175,23 @@ func marshalAttrs(b []byte, fi os.FileInfo) []byte {
 	b = marshalUint32(b, flags)
 	b = marshalUint64(b, uint64(fi.Size()))
 	b = marshalUint32(b, fileModeToSFTP(fi.Mode()))
-	mtime := fi.ModTime().Unix()
-	b = marshalUint32(b, uint32(mtime)) // atime
-	b = marshalUint32(b, uint32(mtime)) // mtime
+	mtime := sftpTime(fi.ModTime().Unix())
+	b = marshalUint32(b, mtime) // atime
+	b = marshalUint32(b, mtime) // mtime
 	return b
+}
+
+// sftpTime clamps a Unix timestamp to the uint32 range used by SFTP v3's time
+// fields, so a far-future (post-2106) or pre-epoch time is pinned to the range
+// boundary instead of silently wrapping to a misleading value.
+func sftpTime(sec int64) uint32 {
+	if sec < 0 {
+		return 0
+	}
+	if sec > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(sec)
 }
 
 // fileAttrs holds the subset of SFTP file attributes that we can apply to the

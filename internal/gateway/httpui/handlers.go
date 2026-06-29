@@ -175,16 +175,31 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 // handleUpload accepts multipart file uploads.
 func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Bound concurrent uploads; wait for a slot unless the client goes away.
+	select {
+	case g.uploadSem <- struct{}{}:
+		defer func() { <-g.uploadSem }()
+	case <-r.Context().Done():
+		return
+	}
+
 	limit := int64(defaultMaxUploadBytes)
 	if g.config.MaxUploadBytes > 0 {
 		limit = g.config.MaxUploadBytes
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// Keep only a small part in memory; larger parts spill to temp files, which
+	// RemoveAll cleans up. This bounds RAM per upload regardless of body size.
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		jsonError(w, http.StatusBadRequest, "failed to parse upload")
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	targetDir := r.FormValue("path")
 	dirFullPath, err := g.resolvePath(targetDir)
@@ -228,11 +243,6 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 		destDir := filepath.Dir(destPath)
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			jsonError(w, http.StatusInternalServerError, "failed to create directory")
-			return
-		}
-		destPath, err = g.resolvePath(path.Join(targetDir, cleanName))
-		if err != nil {
-			jsonError(w, http.StatusBadRequest, "invalid file name")
 			return
 		}
 

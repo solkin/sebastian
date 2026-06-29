@@ -44,20 +44,26 @@ type Config struct {
 	MaxUploadBytes int64
 }
 
+// maxConcurrentUploads bounds simultaneous multipart uploads so a burst cannot
+// exhaust memory/disk with parallel spooled bodies.
+const maxConcurrentUploads = 16
+
 // Gateway implements the HTTP file server with web UI.
 type Gateway struct {
-	rootDir string
-	config  Config
-	logger  *slog.Logger
-	server  *http.Server
+	rootDir   string
+	config    Config
+	logger    *slog.Logger
+	server    *http.Server
+	uploadSem chan struct{}
 }
 
 // New creates a new HTTP file server Gateway.
 func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 	g := &Gateway{
-		rootDir: rootDir,
-		config:  cfg,
-		logger:  logger.With("gateway", "http"),
+		rootDir:   rootDir,
+		config:    cfg,
+		logger:    logger.With("gateway", "http"),
+		uploadSem: make(chan struct{}, maxConcurrentUploads),
 	}
 
 	mux := http.NewServeMux()
@@ -81,7 +87,13 @@ func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 // framing, plugins, and base-URI hijacking; inline styles remain allowed.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonce := newNonce()
+		nonce, ok := newNonce()
+		if !ok {
+			// Fail closed: serving a page without a fresh nonce would weaken the
+			// script-src CSP to a predictable value.
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
@@ -99,11 +111,14 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// newNonce returns a fresh base64 CSP nonce.
-func newNonce() string {
+// newNonce returns a fresh base64 CSP nonce. ok is false if the system CSPRNG
+// is unavailable, in which case the caller must not serve the page.
+func newNonce() (nonce string, ok bool) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return base64.StdEncoding.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(b), true
 }
 
 // Name returns the protocol name.
