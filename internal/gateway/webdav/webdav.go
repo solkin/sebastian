@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/solkin/sebastian/internal/gateway"
 )
@@ -29,6 +30,7 @@ type Gateway struct {
 	config  Config
 	logger  *slog.Logger
 	server  *http.Server
+	locks   *lockManager
 }
 
 // New creates a new WebDAV Gateway.
@@ -37,6 +39,7 @@ func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 		rootDir: rootDir,
 		config:  cfg,
 		logger:  logger.With("gateway", "webdav"),
+		locks:   newLockManager(),
 	}
 
 	mux := http.NewServeMux()
@@ -44,6 +47,11 @@ func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 
 	g.server = &http.Server{
 		Handler: gateway.LogMiddleware(g.logger, mux),
+		// Bound header-read and idle-connection time to blunt Slowloris-style
+		// attacks. Read/Write timeouts are left unset so large file transfers are
+		// not cut off mid-stream.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return g
@@ -62,7 +70,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		g.server.Close()
+		// Drain in-flight requests rather than cutting connections abruptly; Stop
+		// bounds the overall drain time.
+		g.server.Shutdown(context.Background())
 	}()
 
 	if err := g.server.Serve(ln); err != http.ErrServerClosed {
@@ -121,6 +131,17 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 // filesystem path. Delegates to gateway.SafePath for path validation.
 func (g *Gateway) resolvePath(urlPath string) (relName string, fullPath string, err error) {
 	return gateway.SafePath(g.rootDir, urlPath)
+}
+
+// lockBlocked reports whether a mutating request on relPath must be refused
+// because a live lock covers it and the request's If header lacks the lock token.
+// It writes a 423 Locked response when it returns true.
+func (g *Gateway) lockBlocked(w http.ResponseWriter, r *http.Request, relPath string) bool {
+	if !g.locks.canModify(relPath, r.Header.Get("If")) {
+		http.Error(w, "Locked", http.StatusLocked)
+		return true
+	}
+	return false
 }
 
 // resolveDestination extracts and validates the Destination header used by

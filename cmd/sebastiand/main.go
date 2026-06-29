@@ -90,10 +90,11 @@ func main() {
 
 	if cfg.Gateways.SFTP.Enabled {
 		gw, err := sftp.New(cfg.RootDir, sftp.Config{
-			ListenAddr:  cfg.Gateways.SFTP.ListenAddr,
-			Username:    cfg.Gateways.SFTP.Username,
-			Password:    cfg.Gateways.SFTP.Password,
-			HostKeyPath: cfg.Gateways.SFTP.HostKeyPath,
+			ListenAddr:     cfg.Gateways.SFTP.ListenAddr,
+			Username:       cfg.Gateways.SFTP.Username,
+			Password:       cfg.Gateways.SFTP.Password,
+			HostKeyPath:    cfg.Gateways.SFTP.HostKeyPath,
+			MaxUploadBytes: cfg.MaxUploadBytes,
 		}, logger)
 		if err != nil {
 			logger.Error("failed to create SFTP gateway", "error", err)

@@ -3,6 +3,8 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -353,8 +355,8 @@ func TestPutObject_MaxUploadBytesPreservesExisting(t *testing.T) {
 	}
 
 	w := serveRequest(g, http.MethodPut, "/mybucket/f.txt", strings.NewReader("too large"), noAuth())
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for over-limit PUT, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for over-limit PUT, got %d: %s", w.Code, w.Body.String())
 	}
 	data, err := os.ReadFile(objectPath)
 	if err != nil {
@@ -371,6 +373,32 @@ func TestPutObject_MaxUploadBytesPreservesExisting(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".seb-tmp-") {
 			t.Fatalf("temporary file was not cleaned up: %s", entry.Name())
 		}
+	}
+}
+
+func TestPutObject_ContentSHA256(t *testing.T) {
+	g, syncDir := testGateway(t, Config{})
+	if err := os.Mkdir(filepath.Join(syncDir, "mybucket"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "hello world"
+	sum := sha256.Sum256([]byte(body))
+
+	// A matching digest is accepted.
+	w := serveRequest(g, http.MethodPut, "/mybucket/ok.txt", strings.NewReader(body),
+		map[string]string{"X-Amz-Content-Sha256": hex.EncodeToString(sum[:])})
+	if w.Code != http.StatusOK {
+		t.Fatalf("matching sha256: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// A wrong digest is rejected and the object is not written.
+	w = serveRequest(g, http.MethodPut, "/mybucket/bad.txt", strings.NewReader(body),
+		map[string]string{"X-Amz-Content-Sha256": hex.EncodeToString(make([]byte, 32))}) // all-zero, won't match
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched sha256: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(syncDir, "mybucket", "bad.txt")); !os.IsNotExist(err) {
+		t.Fatal("object should not be written on sha256 mismatch")
 	}
 }
 

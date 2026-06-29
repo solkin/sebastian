@@ -1,8 +1,12 @@
 package s3
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +17,14 @@ import (
 
 	"github.com/solkin/sebastian/internal/gateway"
 )
+
+// maxListWalkEntries bounds how many objects/prefixes a single ListObjects walk
+// will materialize, so a bucket with a pathological number of files cannot
+// exhaust memory or stall the server. A truncated walk is logged.
+const maxListWalkEntries = 100000
+
+// errWalkLimit aborts the bucket walk once maxListWalkEntries is reached.
+var errWalkLimit = errors.New("list walk limit reached")
 
 // --- S3 XML response types ---
 
@@ -175,6 +187,22 @@ func validateKey(key string) bool {
 	cleaned := filepath.ToSlash(filepath.Clean(key))
 	if strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") || cleaned == ".." {
 		return false
+	}
+	return true
+}
+
+// isHexSHA256 reports whether s is a 64-character lowercase hex string, i.e. a
+// concrete SHA-256 digest as opposed to UNSIGNED-PAYLOAD, a streaming marker, or
+// an absent header.
+func isHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
 	}
 	return true
 }
@@ -429,6 +457,12 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 			return nil
 		}
 
+		// Stop the walk once we have collected the cap; better to truncate (and log)
+		// than to hold an unbounded result set in memory.
+		if len(objects)+len(commonPrefixes) >= maxListWalkEntries {
+			return errWalkLimit
+		}
+
 		relPath, _ := filepath.Rel(bp, path)
 		key := filepath.ToSlash(relPath)
 
@@ -461,8 +495,11 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errWalkLimit) {
 		return nil, nil, err
+	}
+	if errors.Is(err, errWalkLimit) {
+		g.logger.Warn("list objects: result truncated at limit", "limit", maxListWalkEntries)
 	}
 
 	sort.Slice(objects, func(i, j int) bool {
@@ -750,6 +787,17 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
 	}
 
+	// When the client declares a concrete payload SHA-256 (the value the SigV4
+	// signature is computed over), hash the body as we stream it and reject a
+	// mismatch. This closes the integrity gap where a captured signed request
+	// could be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked
+	// streaming markers carry no verifiable digest, so they are not checked.
+	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256")))
+	var hasher hash.Hash
+	if isHexSHA256(declaredHash) {
+		hasher = sha256.New()
+	}
+
 	dir := filepath.Dir(op)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		g.logger.Error("put object: mkdir failed", "bucket", bucket, "key", key, "error", err)
@@ -765,13 +813,32 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	tmpPath := tmpFile.Name()
 
-	size, err := io.Copy(tmpFile, r.Body)
+	var dst io.Writer = tmpFile
+	if hasher != nil {
+		dst = io.MultiWriter(tmpFile, hasher)
+	}
+	size, err := io.Copy(dst, r.Body)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+			return
+		}
 		g.logger.Error("put object: write failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to write object")
 		return
+	}
+
+	if hasher != nil {
+		if actual := hex.EncodeToString(hasher.Sum(nil)); actual != declaredHash {
+			os.Remove(tmpPath)
+			g.logger.Warn("put object: content sha256 mismatch", "bucket", bucket, "key", key)
+			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+				"The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
 	}
 
 	if err := os.Rename(tmpPath, op); err != nil {

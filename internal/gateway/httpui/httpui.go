@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/solkin/sebastian/internal/gateway"
 )
@@ -64,6 +65,11 @@ func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 
 	g.server = &http.Server{
 		Handler: gateway.LogMiddleware(g.logger, securityHeaders(mux)),
+		// Bound header-read and idle-connection time to blunt Slowloris-style
+		// attacks. Read/Write timeouts are left unset so large up/downloads are
+		// not cut off mid-stream.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return g
@@ -113,7 +119,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		g.server.Close()
+		// Drain in-flight requests rather than cutting connections abruptly; Stop
+		// bounds the overall drain time.
+		g.server.Shutdown(context.Background())
 	}()
 
 	if err := g.server.Serve(ln); err != http.ErrServerClosed {

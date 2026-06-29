@@ -2,6 +2,7 @@ package webdav
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,10 @@ import (
 	"strings"
 	"time"
 )
+
+// errUploadTooLarge is returned by the COPY copier when the configured upload
+// cap would be exceeded.
+var errUploadTooLarge = errors.New("upload exceeds maximum size")
 
 // propEntry holds the properties for a single resource in a PROPFIND response.
 type propEntry struct {
@@ -56,35 +61,48 @@ func (g *Gateway) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		depth = "1"
 	}
 
-	var entries []propEntry
+	// Stream the multistatus response: write the parent entry, then page through
+	// children with ReadDir(n) so a directory with very many entries is not fully
+	// buffered in memory. The 207 status is committed before iterating, so any
+	// mid-stream read error can only be logged, not turned into a 500.
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>`)
+	io.WriteString(w, `<D:multistatus xmlns:D="DAV:">`)
 
-	entries = append(entries, makePropEntry(relName, info))
+	writePropResponse(w, makePropEntry(relName, info))
 
 	if info.IsDir() && depth != "0" {
-		children, err := os.ReadDir(fullPath)
-		if err != nil {
-			g.logger.Error("propfind readdir failed", "path", relName, "error", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		for _, child := range children {
-			childRel := child.Name()
-			if relName != "" {
-				childRel = relName + "/" + childRel
+		f, derr := os.Open(fullPath)
+		if derr != nil {
+			g.logger.Error("propfind open dir failed", "path", relName, "error", derr)
+		} else {
+			defer f.Close()
+			for {
+				children, rerr := f.ReadDir(512)
+				for _, child := range children {
+					childRel := child.Name()
+					if relName != "" {
+						childRel = relName + "/" + childRel
+					}
+					childInfo, ierr := child.Info()
+					if ierr != nil {
+						continue
+					}
+					writePropResponse(w, makePropEntry(childRel, childInfo))
+				}
+				if rerr != nil {
+					if rerr != io.EOF {
+						g.logger.Error("propfind readdir failed", "path", relName, "error", rerr)
+					}
+					break
+				}
 			}
-
-			childInfo, err := child.Info()
-			if err != nil {
-				continue
-			}
-
-			entries = append(entries, makePropEntry(childRel, childInfo))
 		}
 	}
 
-	g.logger.Debug("propfind", "path", relName, "depth", depth, "entries", len(entries))
-	writeMultiStatus(w, entries)
+	io.WriteString(w, `</D:multistatus>`)
+	g.logger.Debug("propfind", "path", relName, "depth", depth)
 }
 
 // handleProppatch accepts property changes. This is a stub that acknowledges
@@ -93,6 +111,10 @@ func (g *Gateway) handleProppatch(w http.ResponseWriter, r *http.Request) {
 	relName, fullPath, err := g.resolvePath(r.URL.Path)
 	if err != nil {
 		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	if g.lockBlocked(w, r, relName) {
 		return
 	}
 
@@ -191,6 +213,10 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if g.lockBlocked(w, r, relName) {
+		return
+	}
+
 	if g.config.MaxUploadBytes > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
 	}
@@ -216,6 +242,11 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(tmpFile, r.Body); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		g.logger.Error("put write failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -242,6 +273,10 @@ func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
 	relName, fullPath, err := g.resolvePath(r.URL.Path)
 	if err != nil || relName == "" {
 		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if g.lockBlocked(w, r, relName) {
 		return
 	}
 
@@ -279,6 +314,10 @@ func (g *Gateway) handleMkcol(w http.ResponseWriter, r *http.Request) {
 	relName, fullPath, err := g.resolvePath(r.URL.Path)
 	if err != nil || relName == "" {
 		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if g.lockBlocked(w, r, relName) {
 		return
 	}
 
@@ -320,6 +359,11 @@ func (g *Gateway) handleMove(w http.ResponseWriter, r *http.Request) {
 	dstRel, dstFull, err := g.resolveDestination(r)
 	if err != nil || dstRel == "" {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// MOVE mutates both source (removed) and destination (created/overwritten).
+	if g.lockBlocked(w, r, srcRel) || g.lockBlocked(w, r, dstRel) {
 		return
 	}
 
@@ -376,6 +420,11 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// COPY mutates only the destination.
+	if g.lockBlocked(w, r, dstRel) {
+		return
+	}
+
 	srcInfo, err := os.Stat(srcFull)
 	if os.IsNotExist(err) {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -407,12 +456,17 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cp := &copier{limit: g.config.MaxUploadBytes}
 	copyErr := stageReplace(dstFull, func() error {
 		if srcInfo.IsDir() {
-			return copyDir(srcFull, dstFull)
+			return cp.copyDir(srcFull, dstFull)
 		}
-		return copyFile(srcFull, dstFull)
+		return cp.copyFile(srcFull, dstFull)
 	})
+	if errors.Is(copyErr, errUploadTooLarge) {
+		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	if copyErr != nil {
 		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", copyErr)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -427,35 +481,81 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleLock returns a fake lock token. Real locking is not implemented;
-// this stub is sufficient for macOS Finder and Windows Explorer to operate.
+// handleLock creates (or refreshes) an exclusive write lock and is enforced by
+// the mutating handlers via the If header. Locks are in-memory and single-node.
 func (g *Gateway) handleLock(w http.ResponseWriter, r *http.Request) {
-	var h uint32
-	for _, b := range []byte(r.URL.Path) {
-		h = h*31 + uint32(b)
+	relName, _, err := g.resolvePath(r.URL.Path)
+	if err != nil {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
 	}
-	token := fmt.Sprintf("opaquelocktoken:sebastian-%08x", h)
 
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.Header().Set("Lock-Token", "<"+token+">")
-	w.WriteHeader(http.StatusOK)
+	timeout := parseTimeout(r.Header.Get("Timeout"))
 
-	fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>`)
-	fmt.Fprint(w, `<D:prop xmlns:D="DAV:">`)
-	fmt.Fprint(w, `<D:lockdiscovery><D:activelock>`)
-	fmt.Fprint(w, `<D:locktype><D:write/></D:locktype>`)
-	fmt.Fprint(w, `<D:lockscope><D:exclusive/></D:lockscope>`)
-	fmt.Fprint(w, `<D:depth>infinity</D:depth>`)
-	fmt.Fprint(w, `<D:owner/>`)
-	fmt.Fprint(w, `<D:timeout>Second-3600</D:timeout>`)
-	fmt.Fprintf(w, `<D:locktoken><D:href>%s</D:href></D:locktoken>`, xmlEscapeString(token))
-	fmt.Fprint(w, `</D:activelock></D:lockdiscovery>`)
-	fmt.Fprint(w, `</D:prop>`)
+	// A LOCK carrying an If header and no body refreshes an existing lock rather
+	// than creating a new one.
+	if ifH := r.Header.Get("If"); ifH != "" {
+		for token := range parseIfTokens(ifH) {
+			if lk, ok := g.locks.refresh(token, timeout); ok && lk.covers(relName) {
+				w.Header().Set("Lock-Token", "<"+lk.token+">")
+				writeLockResponse(w, lk, http.StatusOK)
+				return
+			}
+		}
+	}
+
+	// Drain the (optional) lock-info body so keep-alive stays healthy; the owner
+	// element is not persisted.
+	io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+
+	depth := r.Header.Get("Depth")
+	if depth != "0" {
+		depth = "infinity"
+	}
+
+	lk, ok := g.locks.create(relName, depth, timeout)
+	if !ok {
+		http.Error(w, "Locked", http.StatusLocked)
+		return
+	}
+
+	g.logger.Info("locked", "path", relName, "depth", depth)
+	w.Header().Set("Lock-Token", "<"+lk.token+">")
+	writeLockResponse(w, lk, http.StatusOK)
 }
 
-// handleUnlock acknowledges an unlock request (stub).
+// handleUnlock releases the lock named by the Lock-Token header.
 func (g *Gateway) handleUnlock(w http.ResponseWriter, r *http.Request) {
+	token := strings.Trim(r.Header.Get("Lock-Token"), "<> ")
+	if token == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if !g.locks.unlock(token) {
+		http.Error(w, "Conflict", http.StatusConflict)
+		return
+	}
+	g.logger.Info("unlocked", "token", token)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeLockResponse writes the lockdiscovery body returned by LOCK.
+func writeLockResponse(w http.ResponseWriter, lk *lock, status int) {
+	secs := int(time.Until(lk.expires).Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(status)
+	fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>`)
+	fmt.Fprint(w, `<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>`)
+	fmt.Fprint(w, `<D:locktype><D:write/></D:locktype>`)
+	fmt.Fprint(w, `<D:lockscope><D:exclusive/></D:lockscope>`)
+	fmt.Fprintf(w, `<D:depth>%s</D:depth>`, lk.depth)
+	fmt.Fprint(w, `<D:owner/>`)
+	fmt.Fprintf(w, `<D:timeout>Second-%d</D:timeout>`, secs)
+	fmt.Fprintf(w, `<D:locktoken><D:href>%s</D:href></D:locktoken>`, xmlEscapeString(lk.token))
+	fmt.Fprint(w, `</D:activelock></D:lockdiscovery></D:prop>`)
 }
 
 // --- Helpers ---
@@ -478,40 +578,32 @@ func makePropEntry(relName string, info os.FileInfo) propEntry {
 	return e
 }
 
-// writeMultiStatus writes a 207 Multi-Status PROPFIND response.
-func writeMultiStatus(w http.ResponseWriter, entries []propEntry) {
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(http.StatusMultiStatus)
+// writePropResponse writes a single <D:response> element for a PROPFIND entry.
+// The enclosing <D:multistatus> envelope is written by the caller so entries can
+// be streamed one at a time.
+func writePropResponse(w http.ResponseWriter, e propEntry) {
+	fmt.Fprintf(w, `<D:response><D:href>%s</D:href>`, xmlEscapeString(e.Href))
+	fmt.Fprint(w, `<D:propstat><D:prop>`)
 
-	fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>`)
-	fmt.Fprint(w, `<D:multistatus xmlns:D="DAV:">`)
-
-	for _, e := range entries {
-		fmt.Fprintf(w, `<D:response><D:href>%s</D:href>`, xmlEscapeString(e.Href))
-		fmt.Fprint(w, `<D:propstat><D:prop>`)
-
-		if e.IsDir {
-			fmt.Fprint(w, `<D:resourcetype><D:collection/></D:resourcetype>`)
-		} else {
-			fmt.Fprint(w, `<D:resourcetype/>`)
-		}
-
-		fmt.Fprintf(w, `<D:displayname>%s</D:displayname>`, xmlEscapeString(e.DisplayName))
-
-		if !e.IsDir {
-			fmt.Fprintf(w, `<D:getcontentlength>%d</D:getcontentlength>`, e.Size)
-			fmt.Fprintf(w, `<D:getcontenttype>%s</D:getcontenttype>`, xmlEscapeString(e.ContentType))
-		}
-
-		fmt.Fprintf(w, `<D:getlastmodified>%s</D:getlastmodified>`,
-			e.LastModified.UTC().Format(http.TimeFormat))
-
-		fmt.Fprint(w, `</D:prop>`)
-		fmt.Fprint(w, `<D:status>HTTP/1.1 200 OK</D:status>`)
-		fmt.Fprint(w, `</D:propstat></D:response>`)
+	if e.IsDir {
+		fmt.Fprint(w, `<D:resourcetype><D:collection/></D:resourcetype>`)
+	} else {
+		fmt.Fprint(w, `<D:resourcetype/>`)
 	}
 
-	fmt.Fprint(w, `</D:multistatus>`)
+	fmt.Fprintf(w, `<D:displayname>%s</D:displayname>`, xmlEscapeString(e.DisplayName))
+
+	if !e.IsDir {
+		fmt.Fprintf(w, `<D:getcontentlength>%d</D:getcontentlength>`, e.Size)
+		fmt.Fprintf(w, `<D:getcontenttype>%s</D:getcontenttype>`, xmlEscapeString(e.ContentType))
+	}
+
+	fmt.Fprintf(w, `<D:getlastmodified>%s</D:getlastmodified>`,
+		e.LastModified.UTC().Format(http.TimeFormat))
+
+	fmt.Fprint(w, `</D:prop>`)
+	fmt.Fprint(w, `<D:status>HTTP/1.1 200 OK</D:status>`)
+	fmt.Fprint(w, `</D:propstat></D:response>`)
 }
 
 // xmlEscapeString escapes a string for safe inclusion in XML content.
@@ -533,8 +625,24 @@ func isSameOrUnder(path, dir string) bool {
 	return absPath == absDir || strings.HasPrefix(absPath, absDir+string(filepath.Separator))
 }
 
+// copier copies files/trees while enforcing an optional cumulative byte budget,
+// so a COPY of a large tree cannot exceed the configured upload cap (or fill the
+// disk without bound). limit == 0 means unlimited.
+type copier struct {
+	limit  int64
+	copied int64
+}
+
 // copyFile copies a single file using a temp file + atomic rename.
-func copyFile(src, dst string) error {
+func (c *copier) copyFile(src, dst string) error {
+	si, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if c.limit > 0 && c.copied+si.Size() > c.limit {
+		return errUploadTooLarge
+	}
+
 	sf, err := os.Open(src)
 	if err != nil {
 		return err
@@ -555,19 +663,18 @@ func copyFile(src, dst string) error {
 	}
 	tmpFile.Close()
 
-	if si, err := os.Stat(src); err == nil {
-		os.Chtimes(tmpPath, si.ModTime(), si.ModTime())
-	}
+	os.Chtimes(tmpPath, si.ModTime(), si.ModTime())
 
 	if err := os.Rename(tmpPath, dst); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
+	c.copied += si.Size()
 	return nil
 }
 
 // copyDir recursively copies a directory tree.
-func copyDir(src, dst string) error {
+func (c *copier) copyDir(src, dst string) error {
 	si, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -594,11 +701,11 @@ func copyDir(src, dst string) error {
 		}
 
 		if entry.IsDir() {
-			if err := copyDir(srcPath, dstPath); err != nil {
+			if err := c.copyDir(srcPath, dstPath); err != nil {
 				return err
 			}
 		} else {
-			if err := copyFile(srcPath, dstPath); err != nil {
+			if err := c.copyFile(srcPath, dstPath); err != nil {
 				return err
 			}
 		}

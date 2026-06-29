@@ -16,10 +16,23 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/solkin/sebastian/internal/gateway"
+)
+
+const (
+	// maxSFTPConnections bounds concurrently served connections so a flood of TCP
+	// connections cannot spawn unbounded goroutines and SSH state.
+	maxSFTPConnections = 256
+	// sftpHandshakeTimeout bounds the SSH handshake so a client cannot hold a
+	// connection open indefinitely before authenticating.
+	sftpHandshakeTimeout = 30 * time.Second
+	// sftpIdleTimeout closes a connection that sends no SFTP packet within the
+	// window, reclaiming idle/slow-loris connections.
+	sftpIdleTimeout = 5 * time.Minute
 )
 
 // Config holds SFTP gateway configuration.
@@ -28,6 +41,9 @@ type Config struct {
 	Username    string `yaml:"username"`
 	Password    string `yaml:"password"`
 	HostKeyPath string `yaml:"host_key_path"`
+	// MaxUploadBytes caps the highest offset+length a single WRITE may reach,
+	// bounding the size of any one uploaded file. 0 = unlimited.
+	MaxUploadBytes int64
 }
 
 // Gateway implements the SFTP protocol over SSH.
@@ -39,6 +55,7 @@ type Gateway struct {
 	sshConfig *ssh.ServerConfig
 	wg        sync.WaitGroup
 	closed    chan struct{}
+	connSem   chan struct{}
 }
 
 // New creates a new SFTP Gateway. cfg.HostKeyPath must be set.
@@ -48,6 +65,7 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 		config:  cfg,
 		logger:  logger.With("gateway", "sftp"),
 		closed:  make(chan struct{}),
+		connSem: make(chan struct{}, maxSFTPConnections),
 	}
 
 	sshCfg := &ssh.ServerConfig{
@@ -74,9 +92,17 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 		sshCfg.NoClientAuth = true
 	}
 
-	hostKey, err := loadOrGenerateHostKey(cfg.HostKeyPath)
+	hostKey, generated, err := loadOrGenerateHostKey(cfg.HostKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("host key: %w", err)
+	}
+	if generated {
+		// A freshly generated host key means clients pinning the previous identity
+		// will see a host-key-changed warning. Surface it loudly so an ephemeral or
+		// misconfigured key path (e.g. a non-persistent container layer) is noticed
+		// rather than silently defeating host-key verification.
+		g.logger.Warn("generated a new SFTP host key; clients will see a new host identity",
+			"path", cfg.HostKeyPath)
 	}
 	sshCfg.AddHostKey(hostKey)
 
@@ -115,8 +141,14 @@ func (g *Gateway) Start(ctx context.Context) error {
 			g.logger.Error("accept failed", "error", err)
 			continue
 		}
-		g.wg.Add(1)
-		go g.handleConnection(conn)
+		select {
+		case g.connSem <- struct{}{}:
+			g.wg.Add(1)
+			go g.handleConnection(conn)
+		default:
+			g.logger.Warn("connection limit reached, rejecting", "remote", conn.RemoteAddr())
+			conn.Close()
+		}
 	}
 }
 
@@ -141,6 +173,7 @@ func (g *Gateway) Stop(ctx context.Context) error {
 
 func (g *Gateway) handleConnection(conn net.Conn) {
 	defer g.wg.Done()
+	defer func() { <-g.connSem }()
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -148,12 +181,17 @@ func (g *Gateway) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Bound the handshake so an unauthenticated client cannot hold the connection
+	// open; cleared once the SFTP loop installs its own per-packet idle deadline.
+	conn.SetDeadline(time.Now().Add(sftpHandshakeTimeout))
+
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, g.sshConfig)
 	if err != nil {
 		g.logger.Debug("ssh handshake failed", "remote", conn.RemoteAddr(), "error", err)
 		return
 	}
 	defer sshConn.Close()
+	conn.SetDeadline(time.Time{})
 
 	g.logger.Info("ssh connection", "remote", sshConn.RemoteAddr(), "user", sshConn.User())
 
@@ -171,11 +209,11 @@ func (g *Gateway) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		go g.handleSession(ch, requests)
+		go g.handleSession(conn, ch, requests)
 	}
 }
 
-func (g *Gateway) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
+func (g *Gateway) handleSession(conn net.Conn, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -194,7 +232,7 @@ func (g *Gateway) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			continue
 		}
 		req.Reply(true, nil)
-		g.serveSFTP(ch)
+		g.serveSFTP(conn, ch)
 		return
 	}
 }
@@ -205,24 +243,28 @@ func (g *Gateway) resolvePath(reqPath string) (string, error) {
 	return fullPath, err
 }
 
-func loadOrGenerateHostKey(path string) (ssh.Signer, error) {
+// loadOrGenerateHostKey loads the host key at path, or generates and persists a
+// new one if the file does not exist. The second return value reports whether a
+// new key was generated (so the caller can warn about the changed host identity).
+func loadOrGenerateHostKey(path string) (ssh.Signer, bool, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
-		return ssh.ParsePrivateKey(data)
+		signer, perr := ssh.ParsePrivateKey(data)
+		return signer, false, perr
 	}
 
 	if !os.IsNotExist(err) {
-		return nil, err
+		return nil, false, err
 	}
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
+		return nil, false, fmt.Errorf("generate key: %w", err)
 	}
 
 	keyBytes, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return nil, fmt.Errorf("marshal key: %w", err)
+		return nil, false, fmt.Errorf("marshal key: %w", err)
 	}
 
 	pemBlock := pem.EncodeToMemory(&pem.Block{
@@ -231,11 +273,12 @@ func loadOrGenerateHostKey(path string) (ssh.Signer, error) {
 	})
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := os.WriteFile(path, pemBlock, 0o600); err != nil {
-		return nil, fmt.Errorf("write host key: %w", err)
+		return nil, false, fmt.Errorf("write host key: %w", err)
 	}
 
-	return ssh.ParsePrivateKey(pemBlock)
+	signer, perr := ssh.ParsePrivateKey(pemBlock)
+	return signer, true, perr
 }

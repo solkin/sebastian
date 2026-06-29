@@ -101,7 +101,7 @@ At least one gateway must be enabled. When SFTP is enabled, `host_key_path` must
 
 SFTP runs over SSH, which requires two separate mechanisms:
 
-- **Server identity key** (`host_key_path`) — the server's cryptographic identity, similar to a TLS certificate. SSH clients verify this key to ensure they are connecting to the correct server. The key file is auto-generated on first startup if it does not exist at the specified path. Keep the same file across restarts to avoid "host key changed" warnings in clients.
+- **Server identity key** (`host_key_path`) — the server's cryptographic identity, similar to a TLS certificate. SSH clients verify this key to ensure they are connecting to the correct server. The key file is auto-generated on first startup if it does not exist at the specified path (a warning is logged when this happens). Keep the same file across restarts to avoid "host key changed" warnings in clients — in Docker, mount a volume covering the key path (the image stores it at `/data/sftp_host_key` and declares `/data` as a volume, so a named volume like `-v sebastian-data:/data` persists it across container recreation).
 - **Client authentication** (`username` / `password`) — credentials that clients must provide to connect. If both are empty, any client can connect without authentication.
 
 #### Connecting
@@ -137,9 +137,11 @@ Any S3 SDK or tool configured with the same credentials works out of the box.
 
 - Legacy Signature V2 (`AWS key:signature`) is not supported.
 - Presigned URLs are validated against their `X-Amz-Expires` window.
-- The request body is not re-hashed: the signature authenticates the caller, but
-  payload integrity is not independently verified and `aws-chunked` streaming
-  bodies are not decoded. Run behind TLS for transport security.
+- When a client sends a concrete `x-amz-content-sha256` digest, uploads are
+  re-hashed and rejected on mismatch, so a captured signed request cannot be
+  replayed with a swapped body. `UNSIGNED-PAYLOAD` and `aws-chunked` streaming
+  bodies carry no verifiable digest and are not integrity-checked; run behind TLS
+  for transport security.
 
 Leaving both keys empty disables authentication (all requests are allowed).
 

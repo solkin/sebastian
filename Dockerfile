@@ -16,7 +16,10 @@ RUN addgroup -S sebastian && adduser -S -G sebastian sebastian \
     && mkdir -p /data/files \
     && chown -R sebastian:sebastian /data
 
-VOLUME /data/files
+# Declare the whole /data tree as a volume, not just /data/files, so the SFTP
+# host key at /data/sftp_host_key persists across container restarts instead of
+# being regenerated (which would trip host-key-changed warnings on clients).
+VOLUME /data
 
 USER sebastian
 

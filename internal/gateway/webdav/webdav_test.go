@@ -507,13 +507,61 @@ func TestLock(t *testing.T) {
 func TestUnlock(t *testing.T) {
 	_, ts := newTestGateway(t, "", "")
 
+	// Acquire a real lock, then release it with the issued token.
+	lockResp := doReq(t, "LOCK", ts.URL+"/file.txt", "", nil)
+	lockResp.Body.Close()
+	token := lockResp.Header.Get("Lock-Token")
+	if token == "" {
+		t.Fatal("expected Lock-Token header from LOCK")
+	}
+
 	resp := doReq(t, "UNLOCK", ts.URL+"/file.txt", "", map[string]string{
-		"Lock-Token": "<opaquelocktoken:test>",
+		"Lock-Token": token,
 	})
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+}
+
+func TestUnlock_UnknownToken(t *testing.T) {
+	_, ts := newTestGateway(t, "", "")
+
+	resp := doReq(t, "UNLOCK", ts.URL+"/file.txt", "", map[string]string{
+		"Lock-Token": "<opaquelocktoken:never-issued>",
+	})
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for unknown lock token, got %d", resp.StatusCode)
+	}
+}
+
+func TestLockEnforcement(t *testing.T) {
+	_, ts := newTestGateway(t, "", "")
+
+	lockResp := doReq(t, "LOCK", ts.URL+"/file.txt", "", nil)
+	lockResp.Body.Close()
+	token := lockResp.Header.Get("Lock-Token") // "<opaquelocktoken:...>"
+	if token == "" {
+		t.Fatal("expected Lock-Token header")
+	}
+
+	// A write to the locked path without the token is refused.
+	resp := doReq(t, http.MethodPut, ts.URL+"/file.txt", "data", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusLocked {
+		t.Fatalf("expected 423 for write to locked path, got %d", resp.StatusCode)
+	}
+
+	// A write carrying the lock token in the If header succeeds.
+	resp = doReq(t, http.MethodPut, ts.URL+"/file.txt", "data", map[string]string{
+		"If": "(" + token + ")",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 201/204 for tokened write, got %d", resp.StatusCode)
 	}
 }
 
@@ -924,8 +972,8 @@ func TestPut_MaxUploadBytesPreservesExisting(t *testing.T) {
 
 	resp := doReq(t, http.MethodPut, ts.URL+"/f.txt", "too large", nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for over-limit PUT, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for over-limit PUT, got %d", resp.StatusCode)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

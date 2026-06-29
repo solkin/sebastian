@@ -54,8 +54,15 @@ func testGateway(t *testing.T, syncDir string, user, pass string) string {
 			if err != nil {
 				return
 			}
-			g.wg.Add(1)
-			go g.handleConnection(conn)
+			// Mirror Start's connection-limit acquire so handleConnection's paired
+			// semaphore release stays balanced.
+			select {
+			case g.connSem <- struct{}{}:
+				g.wg.Add(1)
+				go g.handleConnection(conn)
+			default:
+				conn.Close()
+			}
 		}
 	}()
 
@@ -1052,14 +1059,20 @@ func TestHostKeyPersistence(t *testing.T) {
 	metaDir := t.TempDir()
 	keyPath := filepath.Join(metaDir, "test_host_key")
 
-	key1, err := loadOrGenerateHostKey(keyPath)
+	key1, gen1, err := loadOrGenerateHostKey(keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !gen1 {
+		t.Error("first load should report a generated key")
+	}
 
-	key2, err := loadOrGenerateHostKey(keyPath)
+	key2, gen2, err := loadOrGenerateHostKey(keyPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if gen2 {
+		t.Error("second load should reuse the persisted key, not generate")
 	}
 
 	if key1.PublicKey().Marshal() == nil || key2.PublicKey().Marshal() == nil {
