@@ -877,14 +877,20 @@ func (s *Store) validateDest(dest string) error {
 // and the number of bytes written. wantSize is the expected total; the finished
 // file is checked against it before anything is published.
 //
-// The scratch file lives in the staging directory, so a crash mid-assembly leaves
-// nothing in a user-visible bucket and the whole attempt is discarded with the
-// upload. The final rename is atomic, so readers see either no object or the
-// complete one.
+// The scratch file is created in the destination directory, exactly as a plain
+// PutObject does, so publishing is a same-directory rename: atomic (readers see
+// either no object or the complete one) and immune to the destination being a
+// different mount from the staging area. A crash mid-assembly leaves a
+// ".seb-tmp-" file that the janitor's age-bounded sweep collects.
 func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (string, int64, error) {
 	dir := s.uploadDir(id)
 
-	tmp, err := os.CreateTemp(dir, tempPrefix+"assemble-*")
+	destDir := filepath.Dir(dest)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return "", 0, fmt.Errorf("multipart: create destination dir: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(destDir, tempPrefix+"assemble-*")
 	if err != nil {
 		return "", 0, fmt.Errorf("multipart: create assembly temp: %w", err)
 	}
@@ -946,11 +952,6 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 		return "", 0, fmt.Errorf("multipart: close assembled object: %w", err)
 	}
 
-	destDir := filepath.Dir(dest)
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		os.Remove(tmpPath)
-		return "", 0, fmt.Errorf("multipart: create destination dir: %w", err)
-	}
 	if err := os.Rename(tmpPath, dest); err != nil {
 		os.Remove(tmpPath)
 		return "", 0, fmt.Errorf("multipart: publish object: %w", err)

@@ -213,6 +213,14 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	_, initiating := query["uploads"]
 	uploadID := query.Get("uploadId")
 
+	// A part upload missing its uploadId must not fall through to PutObject: that
+	// would silently overwrite the whole object with the bytes of one part.
+	if _, ok := query["partNumber"]; ok && uploadID == "" {
+		writeS3Error(w, http.StatusBadRequest, "InvalidRequest",
+			"A partNumber requires an uploadId. Start a multipart upload first.")
+		return
+	}
+
 	switch {
 	case initiating && r.Method == http.MethodPost:
 		g.handleCreateMultipartUpload(w, r, bucket, key)

@@ -331,7 +331,7 @@ func (g *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
 		Xmlns:    s3Xmlns,
-		Location: "/" + bucket + "/" + escapeKeyPath(key),
+		Location: g.objectLocation(r, bucket, key),
 		Bucket:   bucket,
 		Key:      key,
 		ETag:     `"` + result.ETag + `"`,
@@ -570,8 +570,34 @@ func parseNonNegativeInt(raw string, def int) (int, bool) {
 	return n, true
 }
 
-// escapeKeyPath percent-encodes a key for use in the Location header of a
-// completion response, leaving the "/" separators intact.
+// objectLocation builds the absolute URL a completion response reports, the way
+// AWS does. The bucket is kept in the path when the request was path-style and
+// dropped when it arrived virtual-hosted, so the URL echoes how the client
+// addresses this server. Scheme is inferred from TLS and the proxy's
+// X-Forwarded-Proto, since sebastian itself serves plain HTTP behind a proxy.
+func (g *Gateway) objectLocation(r *http.Request, bucket, key string) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto == "http" || proto == "https" {
+		scheme = proto
+	}
+
+	host := r.Host
+	if host == "" {
+		return "/" + bucket + "/" + escapeKeyPath(key)
+	}
+
+	path := "/" + escapeKeyPath(key)
+	if g.extractBucketFromHost(host) == "" {
+		path = "/" + bucket + path
+	}
+	return scheme + "://" + host + path
+}
+
+// escapeKeyPath percent-encodes a key for use in the Location of a completion
+// response, leaving the "/" separators intact.
 func escapeKeyPath(key string) string {
 	segments := strings.Split(key, "/")
 	for i, s := range segments {

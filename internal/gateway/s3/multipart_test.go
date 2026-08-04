@@ -901,3 +901,145 @@ func TestMultipart_ContentSHA256Mismatch(t *testing.T) {
 		t.Fatalf("unsigned payload: status %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestListObjects_SkipsScratchFiles(t *testing.T) {
+	g, root := testGateway(t, Config{})
+	if err := os.Mkdir(filepath.Join(root, "b"), 0o755); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	// A write in flight (or a crashed one) leaves scratch files behind. They are
+	// not objects and must never be advertised as keys — a client would otherwise
+	// see a key that vanishes the instant the write is renamed into place.
+	for _, name := range []string{".seb-tmp-inflight", ".seb-bak-rollback"} {
+		if err := os.WriteFile(filepath.Join(root, "b", name), []byte("partial"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "b", "real.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write object: %v", err)
+	}
+
+	for _, url := range []string{"/b?list-type=2", "/b"} {
+		w := serveRequest(g, http.MethodGet, url, nil, noAuth())
+		if w.Code != http.StatusOK {
+			t.Fatalf("list %s: status %d", url, w.Code)
+		}
+		if strings.Contains(w.Body.String(), ".seb-tmp-") || strings.Contains(w.Body.String(), ".seb-bak-") {
+			t.Fatalf("scratch file listed as an object by %s: %s", url, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "real.txt") {
+			t.Fatalf("real object missing from %s listing", url)
+		}
+	}
+}
+
+func TestMultipart_PartNumberWithoutUploadIDIsRejected(t *testing.T) {
+	g, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+
+	original := []byte("the object as it should stay")
+	if w := serveRequest(g, http.MethodPut, "/bucket/obj", bytes.NewReader(original), noAuth()); w.Code != http.StatusOK {
+		t.Fatalf("seed object: status %d", w.Code)
+	}
+
+	// Without this guard the request would fall through to PutObject and replace
+	// the whole object with one part's bytes.
+	w := serveRequest(g, http.MethodPut, "/bucket/obj?partNumber=1", bytes.NewReader([]byte("just a part")), noAuth())
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "InvalidRequest" {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+
+	got := serveRequest(g, http.MethodGet, "/bucket/obj", nil, noAuth())
+	if !bytes.Equal(got.Body.Bytes(), original) {
+		t.Fatalf("object was overwritten: %q", got.Body.String())
+	}
+}
+
+func TestMultipart_LeavesNoScratchFilesInBucket(t *testing.T) {
+	g, root, _ := multipartGateway(t, Config{}, multipart.Limits{MinPartBytes: 16})
+
+	// A completion that fails validation must not leave a partial assembly behind.
+	bad := initiateUpload(t, g, "bucket", "nested/dir/failed.bin")
+	e1 := uploadPart(t, g, "bucket", "nested/dir/failed.bin", bad, 1, bytes.Repeat([]byte("a"), 4))
+	e2 := uploadPart(t, g, "bucket", "nested/dir/failed.bin", bad, 2, bytes.Repeat([]byte("b"), 4))
+	if w := completeUpload(g, "bucket", "nested/dir/failed.bin", bad,
+		[]CompletePartEntry{{PartNumber: 1, ETag: e1}, {PartNumber: 2, ETag: e2}}); w.Code == http.StatusOK {
+		t.Fatal("undersized part should have failed the completion")
+	}
+
+	// And neither must a successful one, including into a directory that did not
+	// exist before.
+	ok := initiateUpload(t, g, "bucket", "nested/dir/done.bin")
+	payloads := [][]byte{bytes.Repeat([]byte("a"), 32), bytes.Repeat([]byte("b"), 8)}
+	var parts []CompletePartEntry
+	for i, p := range payloads {
+		parts = append(parts, CompletePartEntry{
+			PartNumber: i + 1,
+			ETag:       uploadPart(t, g, "bucket", "nested/dir/done.bin", ok, i+1, p),
+		})
+	}
+	if w := completeUpload(g, "bucket", "nested/dir/done.bin", ok, parts); w.Code != http.StatusOK {
+		t.Fatalf("complete: status %d: %s", w.Code, w.Body.String())
+	}
+
+	var leftovers []string
+	filepath.WalkDir(filepath.Join(root, "bucket"), func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && gateway.IsScratchFile(d.Name()) {
+			leftovers = append(leftovers, path)
+		}
+		return nil
+	})
+	if len(leftovers) != 0 {
+		t.Fatalf("scratch files left in the bucket: %v", leftovers)
+	}
+
+	got := serveRequest(g, http.MethodGet, "/bucket/nested/dir/done.bin", nil, noAuth())
+	if !bytes.Equal(got.Body.Bytes(), bytes.Join(payloads, nil)) {
+		t.Fatal("assembled object has wrong content")
+	}
+}
+
+func TestMultipart_CompleteLocation(t *testing.T) {
+	g, _, _ := multipartGateway(t, Config{Domain: "s3.example.com"}, multipart.Limits{})
+
+	complete := func(t *testing.T, headers map[string]string, urlPrefix string) string {
+		t.Helper()
+		w := serveRequest(g, http.MethodPost, urlPrefix+"?uploads", nil, headers)
+		var init InitiateMultipartUploadResult
+		if err := xml.Unmarshal(w.Body.Bytes(), &init); err != nil {
+			t.Fatalf("parse initiate: %v", err)
+		}
+		partURL := fmt.Sprintf("%s?partNumber=1&uploadId=%s", urlPrefix, init.UploadID)
+		pw := serveRequest(g, http.MethodPut, partURL, bytes.NewReader([]byte("data")), headers)
+		etag := pw.Header().Get("ETag")
+
+		body := completeBody([]CompletePartEntry{{PartNumber: 1, ETag: etag}})
+		cw := serveRequest(g, http.MethodPost, fmt.Sprintf("%s?uploadId=%s", urlPrefix, init.UploadID),
+			strings.NewReader(body), headers)
+		if cw.Code != http.StatusOK {
+			t.Fatalf("complete: status %d: %s", cw.Code, cw.Body.String())
+		}
+		var res CompleteMultipartUploadResult
+		if err := xml.Unmarshal(cw.Body.Bytes(), &res); err != nil {
+			t.Fatalf("parse complete: %v", err)
+		}
+		return res.Location
+	}
+
+	// Path-style keeps the bucket in the path.
+	loc := complete(t, map[string]string{"Host": "s3.example.com"}, "/bucket/a%20b.bin")
+	if want := "http://s3.example.com/bucket/a%20b.bin"; loc != want {
+		t.Fatalf("path-style location = %q, want %q", loc, want)
+	}
+
+	// Virtual-hosted requests already carry the bucket in the host.
+	loc = complete(t, map[string]string{"Host": "bucket.s3.example.com"}, "/vh.bin")
+	if want := "http://bucket.s3.example.com/vh.bin"; loc != want {
+		t.Fatalf("virtual-hosted location = %q, want %q", loc, want)
+	}
+
+	// A TLS-terminating proxy is reflected in the scheme.
+	loc = complete(t, map[string]string{"Host": "s3.example.com", "X-Forwarded-Proto": "https"}, "/bucket/tls.bin")
+	if want := "https://s3.example.com/bucket/tls.bin"; loc != want {
+		t.Fatalf("forwarded-proto location = %q, want %q", loc, want)
+	}
+}

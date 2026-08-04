@@ -185,7 +185,11 @@ boto3, rclone, and the S3 SDKs upload in parallel chunks out of the box:
 - Assembly re-hashes every part as it is copied and checks the finished file's
   size before publishing it, so a part corrupted on disk fails the completion
   instead of producing a bad object. The object appears under its key with a
-  single atomic rename.
+  single atomic rename, in the same directory, so it works even when a bucket is
+  a separate mount.
+- Atomic-write scratch files (`.seb-tmp-*`, `.seb-bak-*`) are never reported as
+  objects by `ListObjects`, so a write in flight cannot show up as a key that
+  disappears a moment later.
 - All upload state lives on disk, so a restart mid-upload loses nothing: the new
   process can accept further parts for, complete, or abort an upload its
   predecessor started.
