@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -870,5 +871,33 @@ func TestMultipart_ListUploadsDelimiterAndPaging(t *testing.T) {
 	}
 	if len(seen) != 4 {
 		t.Fatalf("paged over %d uploads, want 4", len(seen))
+	}
+}
+
+func TestMultipart_ContentSHA256Mismatch(t *testing.T) {
+	g, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+
+	uploadID := initiateUpload(t, g, "bucket", "obj")
+	other := sha256.Sum256([]byte("a body we are not sending"))
+	headers := map[string]string{"X-Amz-Content-Sha256": hex.EncodeToString(other[:])}
+
+	url := fmt.Sprintf("/bucket/obj?partNumber=1&uploadId=%s", uploadID)
+	w := serveRequest(g, http.MethodPut, url, bytes.NewReader([]byte("payload")), headers)
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "XAmzContentSHA256Mismatch" {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+
+	// A matching digest is accepted, and UNSIGNED-PAYLOAD is not checked at all.
+	payload := []byte("payload")
+	sum := sha256.Sum256(payload)
+	w = serveRequest(g, http.MethodPut, url, bytes.NewReader(payload),
+		map[string]string{"X-Amz-Content-Sha256": hex.EncodeToString(sum[:])})
+	if w.Code != http.StatusOK {
+		t.Fatalf("matching digest: status %d: %s", w.Code, w.Body.String())
+	}
+	w = serveRequest(g, http.MethodPut, url, bytes.NewReader(payload),
+		map[string]string{"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("unsigned payload: status %d: %s", w.Code, w.Body.String())
 	}
 }

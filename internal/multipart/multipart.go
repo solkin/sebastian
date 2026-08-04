@@ -17,11 +17,13 @@ package multipart
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"os"
@@ -92,6 +94,9 @@ var (
 	ErrBusy = errors.New("multipart: too many concurrent part uploads")
 	// ErrBadDigest means the body did not match the client-supplied Content-MD5.
 	ErrBadDigest = errors.New("multipart: content-md5 mismatch")
+	// ErrContentSHA256Mismatch means the body did not match the concrete
+	// x-amz-content-sha256 the request declared (and was signed over).
+	ErrContentSHA256Mismatch = errors.New("multipart: x-amz-content-sha256 mismatch")
 	// ErrCorruptPart means a staged part no longer hashes to the digest recorded
 	// when it was uploaded.
 	ErrCorruptPart = errors.New("multipart: staged part failed integrity check")
@@ -160,6 +165,17 @@ type Part struct {
 	Size         int64
 	ETag         string // hex MD5 of the part's bytes, without quotes
 	LastModified time.Time
+}
+
+// Checksums carries the digests a client declared for a part body. Both fields
+// are optional; each is enforced only when present and well-formed.
+type Checksums struct {
+	// ContentMD5 is the base64 MD5 from the Content-MD5 header.
+	ContentMD5 string
+	// ContentSHA256 is the hex SHA-256 from x-amz-content-sha256. Streaming
+	// markers such as UNSIGNED-PAYLOAD carry no digest and are ignored by the
+	// caller, which passes only a concrete hex value.
+	ContentSHA256 string
 }
 
 // CompletePart is one entry of a client-supplied completion list.
@@ -313,8 +329,17 @@ func parsePartFileName(name string) (number int, md5hex string, ok bool) {
 	return n, digest, true
 }
 
-func isHexMD5(s string) bool {
-	if len(s) != 32 {
+func isHexMD5(s string) bool { return isLowerHex(s, 32) }
+
+// isHexSHA256 reports whether s is a concrete SHA-256 digest, as opposed to
+// UNSIGNED-PAYLOAD, a streaming marker, or an absent header.
+func isHexSHA256(s string) bool { return isLowerHex(normalizeHex(s), 64) }
+
+// normalizeHex trims and lowercases a hex digest supplied by a client.
+func normalizeHex(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
@@ -470,9 +495,10 @@ func (s *Store) countUploads() (int, error) {
 // but a scratch file, and re-uploading a part number simply replaces it, which is
 // what makes a retry after a failed part safe.
 //
-// contentMD5, when non-empty, is the client's base64 Content-MD5 header and is
-// enforced against the received bytes.
-func (s *Store) WritePart(uploadID string, number int, body io.Reader, contentMD5 string) (Part, error) {
+// Any digest the client declared in checks is enforced against the received
+// bytes, so a part cannot be staged with content other than the one the request
+// was signed for.
+func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Checksums) (Part, error) {
 	if !ValidUploadID(uploadID) {
 		return Part{}, ErrNoSuchUpload
 	}
@@ -504,9 +530,15 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, contentMD
 	tmpPath := tmp.Name()
 
 	hasher := md5.New()
+	var sha hash.Hash
+	writers := []io.Writer{tmp, hasher}
+	if isHexSHA256(checks.ContentSHA256) {
+		sha = sha256.New()
+		writers = append(writers, sha)
+	}
 	// Read one byte past the cap so an oversized part is detected without
 	// buffering or trusting Content-Length.
-	size, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(body, s.limits.MaxPartBytes+1))
+	size, copyErr := io.Copy(io.MultiWriter(writers...), io.LimitReader(body, s.limits.MaxPartBytes+1))
 	if copyErr == nil && size > s.limits.MaxPartBytes {
 		copyErr = ErrPartTooLarge
 	}
@@ -526,11 +558,17 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, contentMD
 	}
 
 	digest := hex.EncodeToString(hasher.Sum(nil))
-	if contentMD5 != "" {
-		want, err := base64.StdEncoding.DecodeString(strings.TrimSpace(contentMD5))
+	if checks.ContentMD5 != "" {
+		want, err := base64.StdEncoding.DecodeString(strings.TrimSpace(checks.ContentMD5))
 		if err != nil || hex.EncodeToString(want) != digest {
 			os.Remove(tmpPath)
 			return Part{}, ErrBadDigest
+		}
+	}
+	if sha != nil {
+		if hex.EncodeToString(sha.Sum(nil)) != normalizeHex(checks.ContentSHA256) {
+			os.Remove(tmpPath)
+			return Part{}, ErrContentSHA256Mismatch
 		}
 	}
 

@@ -147,6 +147,9 @@ func (g *Gateway) writeMultipartError(w http.ResponseWriter, err error, op, buck
 	case errors.Is(err, multipart.ErrBadDigest):
 		writeS3Error(w, http.StatusBadRequest, "BadDigest",
 			"The Content-MD5 you specified did not match what we received.")
+	case errors.Is(err, multipart.ErrContentSHA256Mismatch):
+		writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+			"The provided 'x-amz-content-sha256' header does not match what was computed.")
 	case errors.Is(err, multipart.ErrCorruptPart):
 		writeS3Error(w, http.StatusInternalServerError, "InternalError",
 			"A previously uploaded part failed its integrity check.")
@@ -259,7 +262,13 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		body = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
 	}
 
-	part, err := g.multipart.WritePart(uploadID, partNumber, body, r.Header.Get("Content-MD5"))
+	// Mirror PutObject: when the client declares a concrete payload SHA-256 — the
+	// value its SigV4 signature covers — the part is re-hashed and a mismatch is
+	// refused, so a captured signed request cannot be replayed with a swapped body.
+	part, err := g.multipart.WritePart(uploadID, partNumber, body, multipart.Checksums{
+		ContentMD5:    r.Header.Get("Content-MD5"),
+		ContentSHA256: r.Header.Get("X-Amz-Content-Sha256"),
+	})
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {

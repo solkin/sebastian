@@ -3,6 +3,7 @@ package multipart
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -61,7 +62,7 @@ func writeParts(t *testing.T, s *Store, uploadID string, payloads [][]byte) []Co
 	t.Helper()
 	var list []CompletePart
 	for i, p := range payloads {
-		part, err := s.WritePart(uploadID, i+1, bytes.NewReader(p), "")
+		part, err := s.WritePart(uploadID, i+1, bytes.NewReader(p), Checksums{})
 		if err != nil {
 			t.Fatalf("write part %d: %v", i+1, err)
 		}
@@ -271,13 +272,13 @@ func TestWritePartLimits(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := s.WritePart(up.ID, 0, bytes.NewReader([]byte("x")), ""); !errors.Is(err, ErrInvalidPartNumber) {
+	if _, err := s.WritePart(up.ID, 0, bytes.NewReader([]byte("x")), Checksums{}); !errors.Is(err, ErrInvalidPartNumber) {
 		t.Fatalf("part 0 error = %v, want ErrInvalidPartNumber", err)
 	}
-	if _, err := s.WritePart(up.ID, 6, bytes.NewReader([]byte("x")), ""); !errors.Is(err, ErrInvalidPartNumber) {
+	if _, err := s.WritePart(up.ID, 6, bytes.NewReader([]byte("x")), Checksums{}); !errors.Is(err, ErrInvalidPartNumber) {
 		t.Fatalf("part 6 error = %v, want ErrInvalidPartNumber", err)
 	}
-	if _, err := s.WritePart(up.ID, 1, bytes.NewReader(bytes.Repeat([]byte("x"), 9)), ""); !errors.Is(err, ErrPartTooLarge) {
+	if _, err := s.WritePart(up.ID, 1, bytes.NewReader(bytes.Repeat([]byte("x"), 9)), Checksums{}); !errors.Is(err, ErrPartTooLarge) {
 		t.Fatalf("oversized part error = %v, want ErrPartTooLarge", err)
 	}
 
@@ -303,15 +304,15 @@ func TestWritePartContentMD5(t *testing.T) {
 	sum := md5.Sum(payload)
 	good := base64Std(sum[:])
 
-	if _, err := s.WritePart(up.ID, 1, bytes.NewReader(payload), good); err != nil {
+	if _, err := s.WritePart(up.ID, 1, bytes.NewReader(payload), Checksums{ContentMD5: good}); err != nil {
 		t.Fatalf("matching Content-MD5 rejected: %v", err)
 	}
 
 	otherSum := md5.Sum([]byte("different"))
-	if _, err := s.WritePart(up.ID, 2, bytes.NewReader(payload), base64Std(otherSum[:])); !errors.Is(err, ErrBadDigest) {
+	if _, err := s.WritePart(up.ID, 2, bytes.NewReader(payload), Checksums{ContentMD5: base64Std(otherSum[:])}); !errors.Is(err, ErrBadDigest) {
 		t.Fatalf("error = %v, want ErrBadDigest", err)
 	}
-	if _, err := s.WritePart(up.ID, 3, bytes.NewReader(payload), "not base64!!"); !errors.Is(err, ErrBadDigest) {
+	if _, err := s.WritePart(up.ID, 3, bytes.NewReader(payload), Checksums{ContentMD5: "not base64!!"}); !errors.Is(err, ErrBadDigest) {
 		t.Fatalf("error = %v, want ErrBadDigest", err)
 	}
 
@@ -335,11 +336,11 @@ func TestWritePartReplacesSamePartNumber(t *testing.T) {
 	// A client retrying a part after a failure sends the same part number again,
 	// possibly with different bytes. The newest upload must win, and exactly one
 	// file may remain on disk for that number.
-	if _, err := s.WritePart(up.ID, 1, bytes.NewReader([]byte("first attempt")), ""); err != nil {
+	if _, err := s.WritePart(up.ID, 1, bytes.NewReader([]byte("first attempt")), Checksums{}); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
 	final := []byte("second attempt")
-	part, err := s.WritePart(up.ID, 1, bytes.NewReader(final), "")
+	part, err := s.WritePart(up.ID, 1, bytes.NewReader(final), Checksums{})
 	if err != nil {
 		t.Fatalf("second write: %v", err)
 	}
@@ -392,7 +393,7 @@ func TestWritePartAbortedMidStreamLeavesNothing(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := s.WritePart(up.ID, 1, &errReader{data: []byte("partial data")}, ""); err == nil {
+	if _, err := s.WritePart(up.ID, 1, &errReader{data: []byte("partial data")}, Checksums{}); err == nil {
 		t.Fatal("expected an error from the interrupted body")
 	}
 
@@ -435,7 +436,7 @@ func TestAbortDiscardsUpload(t *testing.T) {
 	}
 
 	// Every later operation on an aborted upload behaves as if it never existed.
-	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("more")), ""); !errors.Is(err, ErrNoSuchUpload) {
+	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("more")), Checksums{}); !errors.Is(err, ErrNoSuchUpload) {
 		t.Fatalf("write after abort error = %v, want ErrNoSuchUpload", err)
 	}
 	if _, err := s.Complete(up.ID, list, filepath.Join(root, "bucket", "obj")); !errors.Is(err, ErrNoSuchUpload) {
@@ -467,7 +468,7 @@ func TestConcurrentPartUploads(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = s.WritePart(up.ID, i+1, bytes.NewReader(payloads[i]), "")
+			results[i], errs[i] = s.WritePart(up.ID, i+1, bytes.NewReader(payloads[i]), Checksums{})
 		}(i)
 	}
 	wg.Wait()
@@ -513,7 +514,7 @@ func TestConcurrentSamePartNumber(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s.WritePart(up.ID, 1, bytes.NewReader(bytes.Repeat([]byte{byte('a' + i)}, 64)), "")
+			s.WritePart(up.ID, 1, bytes.NewReader(bytes.Repeat([]byte{byte('a' + i)}, 64)), Checksums{})
 		}(i)
 	}
 	wg.Wait()
@@ -541,12 +542,12 @@ func TestConcurrentPartUploadCap(t *testing.T) {
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.WritePart(up.ID, 1, &blockingReader{started: started, release: release, data: []byte("hello")}, "")
+		_, err := s.WritePart(up.ID, 1, &blockingReader{started: started, release: release, data: []byte("hello")}, Checksums{})
 		done <- err
 	}()
 
 	<-started
-	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("second")), ""); !errors.Is(err, ErrBusy) {
+	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("second")), Checksums{}); !errors.Is(err, ErrBusy) {
 		close(release)
 		t.Fatalf("error = %v, want ErrBusy", err)
 	}
@@ -557,7 +558,7 @@ func TestConcurrentPartUploadCap(t *testing.T) {
 	}
 
 	// With the slot free again the next part is accepted.
-	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("second")), ""); err != nil {
+	if _, err := s.WritePart(up.ID, 2, bytes.NewReader([]byte("second")), Checksums{}); err != nil {
 		t.Fatalf("part after slot freed: %v", err)
 	}
 }
@@ -616,7 +617,7 @@ func TestListPartsPagination(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	for i := 1; i <= 5; i++ {
-		if _, err := s.WritePart(up.ID, i, bytes.NewReader([]byte{byte(i)}), ""); err != nil {
+		if _, err := s.WritePart(up.ID, i, bytes.NewReader([]byte{byte(i)}), Checksums{}); err != nil {
 			t.Fatalf("write part %d: %v", i, err)
 		}
 	}
@@ -759,7 +760,7 @@ func TestRestartRecoversUploads(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	head := bytes.Repeat([]byte("a"), 16)
-	if _, err := first.WritePart(up.ID, 1, bytes.NewReader(head), ""); err != nil {
+	if _, err := first.WritePart(up.ID, 1, bytes.NewReader(head), Checksums{}); err != nil {
 		t.Fatalf("write part: %v", err)
 	}
 
@@ -786,7 +787,7 @@ func TestRestartRecoversUploads(t *testing.T) {
 	}
 
 	tail := bytes.Repeat([]byte("b"), 8)
-	tailPart, err := second.WritePart(up.ID, 2, bytes.NewReader(tail), "")
+	tailPart, err := second.WritePart(up.ID, 2, bytes.NewReader(tail), Checksums{})
 	if err != nil {
 		t.Fatalf("write part after restart: %v", err)
 	}
@@ -819,7 +820,7 @@ func TestCleanupExpiresIdleUploads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.WritePart(stale.ID, 1, bytes.NewReader([]byte("data")), ""); err != nil {
+	if _, err := s.WritePart(stale.ID, 1, bytes.NewReader([]byte("data")), Checksums{}); err != nil {
 		t.Fatalf("write part: %v", err)
 	}
 	fresh, err := s.Create("bucket", "fresh")
@@ -856,7 +857,7 @@ func TestCleanupKeepsUploadWithRecentPart(t *testing.T) {
 	// The upload was initiated long ago but a part arrived just now: a long-running
 	// transfer must not be collected out from under the client.
 	backdate(t, s.uploadDir(up.ID), time.Now().Add(-5*time.Hour))
-	if _, err := s.WritePart(up.ID, 1, bytes.NewReader([]byte("recent")), ""); err != nil {
+	if _, err := s.WritePart(up.ID, 1, bytes.NewReader([]byte("recent")), Checksums{}); err != nil {
 		t.Fatalf("write part: %v", err)
 	}
 
@@ -932,4 +933,42 @@ func backdate(t *testing.T, dir string, when time.Time) {
 // base64Std renders a digest the way a Content-MD5 header carries it.
 func base64Std(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func TestWritePartContentSHA256(t *testing.T) {
+	s, _ := testStore(t, Limits{})
+
+	up, err := s.Create("bucket", "obj")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	payload := []byte("signed payload")
+	sum := sha256.Sum256(payload)
+	good := hex.EncodeToString(sum[:])
+
+	if _, err := s.WritePart(up.ID, 1, bytes.NewReader(payload), Checksums{ContentSHA256: good}); err != nil {
+		t.Fatalf("matching sha256 rejected: %v", err)
+	}
+
+	// A request signed over one body must not be able to stage a different one.
+	other := sha256.Sum256([]byte("swapped body"))
+	if _, err := s.WritePart(up.ID, 2, bytes.NewReader(payload), Checksums{ContentSHA256: hex.EncodeToString(other[:])}); !errors.Is(err, ErrContentSHA256Mismatch) {
+		t.Fatalf("error = %v, want ErrContentSHA256Mismatch", err)
+	}
+
+	// Markers that carry no verifiable digest are not treated as a checksum.
+	for _, marker := range []string{"UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", ""} {
+		if _, err := s.WritePart(up.ID, 3, bytes.NewReader(payload), Checksums{ContentSHA256: marker}); err != nil {
+			t.Fatalf("marker %q rejected: %v", marker, err)
+		}
+	}
+
+	parts, _, _, err := s.ListParts(up.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("list parts: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("staged parts = %+v, want parts 1 and 3 only", parts)
+	}
 }

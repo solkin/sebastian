@@ -174,8 +174,10 @@ boto3, rclone, and the S3 SDKs upload in parallel chunks out of the box:
 - Each part is streamed to a scratch file, hashed, and published with a single
   atomic rename. An interrupted transfer leaves nothing staged, and re-sending a
   part number simply replaces it — retrying a failed part is always safe.
-- `Content-MD5` on `UploadPart` is enforced when present; the response `ETag` is
-  the part's MD5.
+- `Content-MD5` on `UploadPart` is enforced when present, as is a concrete
+  `x-amz-content-sha256` (the digest the request's signature covers), so a
+  captured signed request cannot be replayed with a swapped part body. The
+  response `ETag` is the part's MD5.
 - Completion validates the client's part list the way S3 does: parts must be
   strictly ascending, every `ETag` must match what was staged, and every part but
   the last must reach `min_part_bytes` (`InvalidPartOrder`, `InvalidPart`,
