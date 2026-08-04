@@ -187,9 +187,10 @@ boto3, rclone, and the S3 SDKs upload in parallel chunks out of the box:
   instead of producing a bad object. The object appears under its key with a
   single atomic rename, in the same directory, so it works even when a bucket is
   a separate mount.
-- Atomic-write scratch files (`.seb-tmp-*`, `.seb-bak-*`) are never reported as
-  objects by `ListObjects`, so a write in flight cannot show up as a key that
-  disappears a moment later.
+- Atomic-write scratch files (`.seb-tmp-*`, `.seb-bak-*`) are a reserved
+  namespace: they are never reported as objects by `ListObjects`, and no gateway
+  will create a file with one of those prefixes — such a name is refused up front
+  rather than accepted and then swept away as an orphan.
 - All upload state lives on disk, so a restart mid-upload loses nothing: the new
   process can accept further parts for, complete, or abort an upload its
   predecessor started.

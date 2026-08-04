@@ -1043,3 +1043,29 @@ func TestMultipart_CompleteLocation(t *testing.T) {
 		t.Fatalf("forwarded-proto location = %q, want %q", loc, want)
 	}
 }
+
+func TestPutObject_RejectsScratchNamespace(t *testing.T) {
+	g, root := testGateway(t, Config{})
+	if err := os.Mkdir(filepath.Join(root, "b"), 0o755); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	// Accepting such a key would hand the client an object that the janitor's
+	// age-bounded scratch sweep silently deletes a day later.
+	for _, key := range []string{".seb-tmp-notes", "dir/.seb-bak-notes"} {
+		w := serveRequest(g, http.MethodPut, "/b/"+key, strings.NewReader("data"), noAuth())
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("PUT %s: status %d, want 400", key, w.Code)
+		}
+		if _, err := os.Stat(filepath.Join(root, "b", filepath.FromSlash(key))); !os.IsNotExist(err) {
+			t.Fatalf("PUT %s created a file anyway", key)
+		}
+	}
+
+	// A multipart upload cannot smuggle one in either.
+	g2, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+	w := serveRequest(g2, http.MethodPost, "/bucket/.seb-tmp-sneaky?uploads", nil, noAuth())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("initiate with a scratch key: status %d, want 400", w.Code)
+	}
+}

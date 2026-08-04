@@ -51,6 +51,10 @@ const (
 // IsScratchFile reports whether name is an atomic-write scratch file. Such a file
 // is an implementation detail of a write in flight — it is not an object and must
 // not be presented as one.
+//
+// The prefixes are a reserved namespace: SafePath refuses to resolve a path that
+// uses one, so a client cannot create a file the periodic sweep would later
+// delete out from under it.
 func IsScratchFile(name string) bool {
 	return strings.HasPrefix(name, tempFilePrefix) || strings.HasPrefix(name, backupFilePrefix)
 }
@@ -120,6 +124,16 @@ func SafePath(rootDir, reqPath string) (relPath string, fullPath string, err err
 	// multipart parts); no protocol may read, write, or delete inside it.
 	if cleaned == ReservedDirName || strings.HasPrefix(cleaned, ReservedDirName+"/") {
 		return "", "", fmt.Errorf("reserved path")
+	}
+
+	// Likewise for the atomic-write scratch namespace. A client-created file with
+	// one of those prefixes would be indistinguishable from an abandoned temp file
+	// and would eventually be swept away, so the name is refused up front rather
+	// than accepted and later deleted.
+	for _, seg := range strings.Split(cleaned, "/") {
+		if IsScratchFile(seg) {
+			return "", "", fmt.Errorf("reserved path")
+		}
 	}
 
 	full := filepath.Join(rootDir, filepath.FromSlash(cleaned))

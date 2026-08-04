@@ -283,3 +283,27 @@ func TestSweepTempFiles_AgeThreshold(t *testing.T) {
 		t.Fatalf("regular file was removed by the unbounded sweep: %v", err)
 	}
 }
+
+func TestSafePath_ScratchNamespaceIsReserved(t *testing.T) {
+	// A client-created file with a scratch prefix would be indistinguishable from
+	// an abandoned atomic-write temp file and would eventually be swept away, so
+	// the name must be refused rather than accepted and later deleted.
+	for _, p := range []string{
+		".seb-tmp-notes",
+		"/.seb-tmp-notes",
+		"photos/.seb-tmp-hidden.jpg",
+		".seb-bak-archive",
+		"a/b/.seb-bak-x/c.txt",
+	} {
+		if _, _, err := SafePath("/data", p); err == nil {
+			t.Fatalf("SafePath(%q) succeeded, want an error", p)
+		}
+	}
+
+	// Names that merely contain the prefix elsewhere stay usable.
+	for _, p := range []string{"my.seb-tmp-file", "seb-tmp-file", "photos/seb-bak.txt"} {
+		if _, _, err := SafePath("/data", p); err != nil {
+			t.Fatalf("SafePath(%q): %v", p, err)
+		}
+	}
+}
