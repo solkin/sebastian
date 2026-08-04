@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -85,18 +86,19 @@ type PartInfo struct {
 
 // ListMultipartUploadsResult is the response for ListMultipartUploads.
 type ListMultipartUploadsResult struct {
-	XMLName            xml.Name     `xml:"ListMultipartUploadsResult"`
-	Xmlns              string       `xml:"xmlns,attr"`
-	Bucket             string       `xml:"Bucket"`
-	KeyMarker          string       `xml:"KeyMarker"`
-	UploadIDMarker     string       `xml:"UploadIdMarker"`
-	NextKeyMarker      string       `xml:"NextKeyMarker,omitempty"`
-	NextUploadIDMarker string       `xml:"NextUploadIdMarker,omitempty"`
-	Prefix             string       `xml:"Prefix,omitempty"`
-	Delimiter          string       `xml:"Delimiter,omitempty"`
-	MaxUploads         int          `xml:"MaxUploads"`
-	IsTruncated        bool         `xml:"IsTruncated"`
-	Uploads            []UploadInfo `xml:"Upload"`
+	XMLName            xml.Name       `xml:"ListMultipartUploadsResult"`
+	Xmlns              string         `xml:"xmlns,attr"`
+	Bucket             string         `xml:"Bucket"`
+	KeyMarker          string         `xml:"KeyMarker"`
+	UploadIDMarker     string         `xml:"UploadIdMarker"`
+	NextKeyMarker      string         `xml:"NextKeyMarker,omitempty"`
+	NextUploadIDMarker string         `xml:"NextUploadIdMarker,omitempty"`
+	Prefix             string         `xml:"Prefix,omitempty"`
+	Delimiter          string         `xml:"Delimiter,omitempty"`
+	MaxUploads         int            `xml:"MaxUploads"`
+	IsTruncated        bool           `xml:"IsTruncated"`
+	Uploads            []UploadInfo   `xml:"Upload"`
+	CommonPrefixes     []CommonPrefix `xml:"CommonPrefixes,omitempty"`
 }
 
 // UploadInfo describes one in-progress upload in a ListMultipartUploads response.
@@ -436,43 +438,114 @@ func (g *Gateway) handleListMultipartUploads(w http.ResponseWriter, r *http.Requ
 		maxUploads = defaultMaxUploads
 	}
 
-	uploads, truncated, err := g.multipart.List(bucket, prefix, keyMarker, uploadIDMarker, maxUploads)
+	delimiter := query.Get("delimiter")
+
+	// Fetch the whole matching set and page it here: with a delimiter, uploads and
+	// the common prefixes they roll up into share one ordered key space, and
+	// truncation has to apply to that merged view. The active-upload cap bounds
+	// how much this can be.
+	uploads, _, err := g.multipart.List(bucket, prefix, "", "", 0)
 	if err != nil {
 		g.writeMultipartError(w, err, "list-uploads", bucket, "")
 		return
 	}
 
-	infos := make([]UploadInfo, 0, len(uploads))
-	for _, u := range uploads {
-		infos = append(infos, UploadInfo{
-			Key:          u.Key,
-			UploadID:     u.ID,
-			Initiator:    sebastianOwner(),
-			Owner:        sebastianOwner(),
-			StorageClass: "STANDARD",
-			Initiated:    u.Initiated.UTC().Format(s3TimeFormat),
-		})
-	}
+	infos, prefixes, truncated, nextKey, nextUploadID :=
+		pageUploads(uploads, prefix, delimiter, keyMarker, uploadIDMarker, maxUploads)
 
 	result := ListMultipartUploadsResult{
-		Xmlns:          s3Xmlns,
-		Bucket:         bucket,
-		KeyMarker:      keyMarker,
-		UploadIDMarker: uploadIDMarker,
-		Prefix:         prefix,
-		Delimiter:      query.Get("delimiter"),
-		MaxUploads:     maxUploads,
-		IsTruncated:    truncated,
-		Uploads:        infos,
-	}
-	if truncated && len(infos) > 0 {
-		last := infos[len(infos)-1]
-		result.NextKeyMarker = last.Key
-		result.NextUploadIDMarker = last.UploadID
+		Xmlns:              s3Xmlns,
+		Bucket:             bucket,
+		KeyMarker:          keyMarker,
+		UploadIDMarker:     uploadIDMarker,
+		Prefix:             prefix,
+		Delimiter:          delimiter,
+		MaxUploads:         maxUploads,
+		IsTruncated:        truncated,
+		Uploads:            infos,
+		CommonPrefixes:     prefixes,
+		NextKeyMarker:      nextKey,
+		NextUploadIDMarker: nextUploadID,
 	}
 
 	g.logger.Debug("list multipart uploads", "bucket", bucket, "count", len(infos))
 	writeXML(w, http.StatusOK, result)
+}
+
+// pageUploads rolls uploads up by delimiter, resumes after the marker pair, and
+// truncates to maxUploads, mirroring how S3 pages ListMultipartUploads.
+//
+// Uploads and common prefixes are ordered together by key; a prefix carries no
+// upload ID, so it sorts ahead of any upload sharing its key.
+func pageUploads(uploads []multipart.Upload, prefix, delimiter, keyMarker, uploadIDMarker string, maxUploads int) (
+	infos []UploadInfo, prefixes []CommonPrefix, truncated bool, nextKey, nextUploadID string) {
+
+	type item struct {
+		key      string
+		uploadID string
+		upload   multipart.Upload
+		isPrefix bool
+	}
+
+	var items []item
+	seenPrefix := make(map[string]bool)
+	for _, u := range uploads {
+		if delimiter != "" {
+			rest := strings.TrimPrefix(u.Key, prefix)
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				cp := prefix + rest[:idx+len(delimiter)]
+				if !seenPrefix[cp] {
+					seenPrefix[cp] = true
+					items = append(items, item{key: cp, isPrefix: true})
+				}
+				continue
+			}
+		}
+		items = append(items, item{key: u.Key, uploadID: u.ID, upload: u})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].key != items[j].key {
+			return items[i].key < items[j].key
+		}
+		return items[i].uploadID < items[j].uploadID
+	})
+
+	if keyMarker != "" || uploadIDMarker != "" {
+		idx := sort.Search(len(items), func(i int) bool {
+			if items[i].key != keyMarker {
+				return items[i].key > keyMarker
+			}
+			return items[i].uploadID > uploadIDMarker
+		})
+		items = items[idx:]
+	}
+
+	if maxUploads > 0 && len(items) > maxUploads {
+		items = items[:maxUploads]
+		truncated = true
+	}
+
+	for _, it := range items {
+		if it.isPrefix {
+			prefixes = append(prefixes, CommonPrefix{Prefix: it.key})
+			continue
+		}
+		infos = append(infos, UploadInfo{
+			Key:          it.upload.Key,
+			UploadID:     it.upload.ID,
+			Initiator:    sebastianOwner(),
+			Owner:        sebastianOwner(),
+			StorageClass: "STANDARD",
+			Initiated:    it.upload.Initiated.UTC().Format(s3TimeFormat),
+		})
+	}
+	if truncated && len(items) > 0 {
+		last := items[len(items)-1]
+		nextKey = last.key
+		nextUploadID = last.uploadID
+	}
+	return infos, prefixes, truncated, nextKey, nextUploadID
 }
 
 // parseNonNegativeInt parses an optional non-negative integer query parameter,

@@ -814,3 +814,61 @@ func TestMultipart_DisabledWhenStoreIsAbsent(t *testing.T) {
 		t.Fatalf("plain put: status %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestMultipart_ListUploadsDelimiterAndPaging(t *testing.T) {
+	g, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+
+	for _, key := range []string{"a.txt", "photos/1.jpg", "photos/2.jpg", "videos/clip.mp4"} {
+		initiateUpload(t, g, "bucket", key)
+	}
+
+	// A delimiter rolls the nested keys up into common prefixes, leaving only the
+	// top-level key as an upload.
+	w := serveRequest(g, http.MethodGet, "/bucket?uploads&delimiter=/", nil, noAuth())
+	var res ListMultipartUploadsResult
+	if err := xml.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(res.Uploads) != 1 || res.Uploads[0].Key != "a.txt" {
+		t.Fatalf("uploads = %+v, want only a.txt", res.Uploads)
+	}
+	if len(res.CommonPrefixes) != 2 ||
+		res.CommonPrefixes[0].Prefix != "photos/" || res.CommonPrefixes[1].Prefix != "videos/" {
+		t.Fatalf("common prefixes = %+v", res.CommonPrefixes)
+	}
+
+	// A prefix narrows the set, and the delimiter still applies within it.
+	w = serveRequest(g, http.MethodGet, "/bucket?uploads&prefix=photos/&delimiter=/", nil, noAuth())
+	var scoped ListMultipartUploadsResult
+	if err := xml.Unmarshal(w.Body.Bytes(), &scoped); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(scoped.Uploads) != 2 || len(scoped.CommonPrefixes) != 0 {
+		t.Fatalf("scoped listing = %+v", scoped)
+	}
+
+	// Paging walks the whole set without repeating or dropping an upload.
+	seen := map[string]bool{}
+	keyMarker, idMarker := "", ""
+	for page := 0; page < 10; page++ {
+		url := fmt.Sprintf("/bucket?uploads&max-uploads=1&key-marker=%s&upload-id-marker=%s", keyMarker, idMarker)
+		w := serveRequest(g, http.MethodGet, url, nil, noAuth())
+		var p ListMultipartUploadsResult
+		if err := xml.Unmarshal(w.Body.Bytes(), &p); err != nil {
+			t.Fatalf("parse page: %v", err)
+		}
+		for _, u := range p.Uploads {
+			if seen[u.UploadID] {
+				t.Fatalf("upload %s returned twice", u.UploadID)
+			}
+			seen[u.UploadID] = true
+		}
+		if !p.IsTruncated {
+			break
+		}
+		keyMarker, idMarker = p.NextKeyMarker, p.NextUploadIDMarker
+	}
+	if len(seen) != 4 {
+		t.Fatalf("paged over %d uploads, want 4", len(seen))
+	}
+}
