@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad_Defaults(t *testing.T) {
@@ -232,4 +233,113 @@ func writeYAML(t *testing.T, content string) string {
 		t.Fatalf("write yaml: %v", err)
 	}
 	return path
+}
+
+func TestLoad_MultipartDefaults(t *testing.T) {
+	path := writeYAML(t, `
+root_dir: /tmp/test
+gateways:
+  s3:
+    enabled: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// Unset multipart fields stay zero; the store resolves them to the
+	// S3-compatible defaults so there is one source of truth.
+	if cfg.Multipart != (MultipartConfig{}) {
+		t.Fatalf("expected zero multipart config, got %+v", cfg.Multipart)
+	}
+}
+
+func TestLoad_MultipartConfig(t *testing.T) {
+	path := writeYAML(t, `
+root_dir: /tmp/test
+multipart:
+  min_part_bytes: 1048576
+  max_part_bytes: 104857600
+  max_parts: 500
+  max_active_uploads: 20
+  max_concurrent_part_uploads: 4
+  upload_ttl: 48h
+  cleanup_interval: 15m
+  temp_file_max_age: 6h
+gateways:
+  s3:
+    enabled: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	m := cfg.Multipart
+	if m.MinPartBytes != 1048576 || m.MaxPartBytes != 104857600 {
+		t.Fatalf("part size limits = %d/%d", m.MinPartBytes, m.MaxPartBytes)
+	}
+	if m.MaxParts != 500 || m.MaxActiveUploads != 20 || m.MaxConcurrentPartUploads != 4 {
+		t.Fatalf("count limits = %+v", m)
+	}
+	if m.UploadTTL != 48*time.Hour || m.CleanupInterval != 15*time.Minute || m.TempFileMaxAge != 6*time.Hour {
+		t.Fatalf("durations = %v/%v/%v", m.UploadTTL, m.CleanupInterval, m.TempFileMaxAge)
+	}
+}
+
+func TestLoad_MultipartEnvOverride(t *testing.T) {
+	path := writeYAML(t, `
+root_dir: /tmp/test
+multipart:
+  max_parts: 500
+  upload_ttl: 48h
+gateways:
+  s3:
+    enabled: true
+`)
+	t.Setenv("SEBASTIAN_MULTIPART_MAX_PARTS", "77")
+	t.Setenv("SEBASTIAN_MULTIPART_MIN_PART_BYTES", "2048")
+	t.Setenv("SEBASTIAN_MULTIPART_MAX_CONCURRENT_PART_UPLOADS", "8")
+	t.Setenv("SEBASTIAN_MULTIPART_UPLOAD_TTL", "90m")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Multipart.MaxParts != 77 {
+		t.Fatalf("max_parts = %d, want 77", cfg.Multipart.MaxParts)
+	}
+	if cfg.Multipart.MinPartBytes != 2048 {
+		t.Fatalf("min_part_bytes = %d, want 2048", cfg.Multipart.MinPartBytes)
+	}
+	if cfg.Multipart.MaxConcurrentPartUploads != 8 {
+		t.Fatalf("max_concurrent_part_uploads = %d, want 8", cfg.Multipart.MaxConcurrentPartUploads)
+	}
+	if cfg.Multipart.UploadTTL != 90*time.Minute {
+		t.Fatalf("upload_ttl = %v, want 90m", cfg.Multipart.UploadTTL)
+	}
+}
+
+func TestLoad_MultipartInvalidValues(t *testing.T) {
+	cases := map[string]string{
+		"min above max": `
+multipart:
+  min_part_bytes: 100
+  max_part_bytes: 10
+`,
+		"negative max parts": `
+multipart:
+  max_parts: -1
+`,
+		"negative ttl": `
+multipart:
+  upload_ttl: -1h
+`,
+	}
+	for name, fragment := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeYAML(t, "root_dir: /tmp/test\ngateways:\n  s3:\n    enabled: true\n"+fragment)
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
 }

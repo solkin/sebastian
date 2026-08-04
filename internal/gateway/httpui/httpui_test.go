@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 func newTestGateway(t *testing.T, username, password string) (*Gateway, string) {
@@ -932,5 +934,53 @@ func TestAuth_WrongCredentials(t *testing.T) {
 	w := serve(g, http.MethodGet, "/_api/list?path=/", nil, basicAuth("admin", "wrong"))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestList_HidesReservedDir(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	if err := os.Mkdir(filepath.Join(dir, gateway.ReservedDirName), 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "photos"), 0o755); err != nil {
+		t.Fatalf("create dir: %v", err)
+	}
+
+	w := serve(g, http.MethodGet, "/_api/list?path=", nil, noAuth())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var res listResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("parse listing: %v", err)
+	}
+	if res.Total != 1 {
+		t.Fatalf("total = %d, want 1 (reserved dir must not be counted)", res.Total)
+	}
+	for _, e := range res.Entries {
+		if e.Name == gateway.ReservedDirName {
+			t.Fatal("reserved dir appeared in the listing")
+		}
+	}
+}
+
+func TestAccess_ReservedDirIsDenied(t *testing.T) {
+	g, dir := newTestGateway(t, "", "")
+	reserved := filepath.Join(dir, gateway.ReservedDirName)
+	if err := os.Mkdir(reserved, 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reserved, "secret.txt"), []byte("staged"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	for _, path := range []string{
+		"/_api/list?path=" + gateway.ReservedDirName,
+		"/_api/dl/" + gateway.ReservedDirName + "/secret.txt",
+	} {
+		w := serve(g, http.MethodGet, path, nil, noAuth())
+		if w.Code == http.StatusOK {
+			t.Fatalf("GET %s was allowed: %s", path, w.Body.String())
+		}
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 // testGateway starts an SFTP gateway on a random port and returns its address.
@@ -1787,5 +1789,74 @@ func TestSubsystemMalformedPayload_NoPanic(t *testing.T) {
 	}
 	if pktType != sshFxpName {
 		t.Fatalf("expected NAME reply after malformed request, got %d", pktType)
+	}
+}
+
+func TestReaddirHidesReservedDir(t *testing.T) {
+	syncDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(syncDir, gateway.ReservedDirName), 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(syncDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	handle := sftpOpendir(t, ch, 1, "/")
+	names := sftpReaddir(t, ch, 2, handle)
+	for _, n := range names {
+		if n == gateway.ReservedDirName {
+			t.Fatalf("reserved dir listed: %v", names)
+		}
+	}
+	if len(names) != 1 || names[0] != "a.txt" {
+		t.Fatalf("listing = %v, want [a.txt]", names)
+	}
+}
+
+func TestOpendirReservedDirDenied(t *testing.T) {
+	syncDir := t.TempDir()
+	reserved := filepath.Join(syncDir, gateway.ReservedDirName)
+	if err := os.Mkdir(reserved, 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reserved, "staged"), []byte("part"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	// Both the directory itself and files inside it are unreachable.
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "/"+gateway.ReservedDirName)
+	if err := writePacket(ch, sshFxpOpendir, req); err != nil {
+		t.Fatalf("write opendir: %v", err)
+	}
+	pktType, _, err := readPacket(ch)
+	if err != nil {
+		t.Fatalf("read opendir reply: %v", err)
+	}
+	if pktType != sshFxpStatus {
+		t.Fatalf("opendir on the reserved dir was allowed (packet type %d)", pktType)
+	}
+
+	req = nil
+	req = marshalUint32(req, 2)
+	req = marshalString(req, "/"+gateway.ReservedDirName+"/staged")
+	if err := writePacket(ch, sshFxpStat, req); err != nil {
+		t.Fatalf("write stat: %v", err)
+	}
+	pktType, _, err = readPacket(ch)
+	if err != nil {
+		t.Fatalf("read stat reply: %v", err)
+	}
+	if pktType != sshFxpStatus {
+		t.Fatalf("stat inside the reserved dir was allowed (packet type %d)", pktType)
 	}
 }

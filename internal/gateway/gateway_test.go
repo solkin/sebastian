@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSafePath_Root(t *testing.T) {
@@ -207,5 +208,78 @@ func TestResponseLogger_DefaultStatus(t *testing.T) {
 	}
 	if rl.Size != 4 {
 		t.Fatalf("expected size 4, got %d", rl.Size)
+	}
+}
+
+func TestSafePath_ReservedDir(t *testing.T) {
+	// The reserved state directory holds staged multipart parts; no protocol may
+	// resolve a path into it.
+	for _, p := range []string{
+		ReservedDirName,
+		"/" + ReservedDirName,
+		ReservedDirName + "/multipart",
+		"/" + ReservedDirName + "/multipart/abc/upload.json",
+		"./" + ReservedDirName,
+	} {
+		if _, _, err := SafePath("/data", p); err == nil {
+			t.Fatalf("SafePath(%q) succeeded, want an error", p)
+		}
+	}
+
+	// A name that merely starts with the reserved name is a normal path.
+	if _, _, err := SafePath("/data", ReservedDirName+"-backup"); err != nil {
+		t.Fatalf("SafePath(%q): %v", ReservedDirName+"-backup", err)
+	}
+}
+
+func TestIsReservedPath(t *testing.T) {
+	if !IsReservedPath("/data", "/data/"+ReservedDirName) {
+		t.Fatal("reserved dir not recognized")
+	}
+	if IsReservedPath("/data", "/data/photos") {
+		t.Fatal("normal dir reported as reserved")
+	}
+	// Only the top-level entry is reserved; the same name deeper down is not.
+	if IsReservedPath("/data", "/data/photos/"+ReservedDirName) {
+		t.Fatal("nested dir with the reserved name reported as reserved")
+	}
+}
+
+func TestSweepTempFiles_AgeThreshold(t *testing.T) {
+	root := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fresh := filepath.Join(root, ".seb-tmp-active")
+	stale := filepath.Join(root, ".seb-bak-orphan")
+	keep := filepath.Join(root, "regular.txt")
+	for _, p := range []string{fresh, stale, keep} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	SweepTempFiles(root, time.Hour, logger)
+
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("a scratch file younger than maxAge was removed: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale scratch file survived: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("regular file was removed: %v", err)
+	}
+
+	// maxAge <= 0 clears everything, which is what startup does.
+	SweepTempFiles(root, 0, logger)
+	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
+		t.Fatal("unbounded sweep left a scratch file behind")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("regular file was removed by the unbounded sweep: %v", err)
 	}
 }

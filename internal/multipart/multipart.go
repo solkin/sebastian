@@ -758,17 +758,23 @@ func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteR
 		byNumber[p.Number] = p
 	}
 
-	selected := make([]Part, 0, len(want))
-	var total int64
+	// Validate the shape of the list before looking at what was staged, so a
+	// misordered request is reported as such rather than as whatever the first
+	// out-of-order entry happens to violate.
 	prev := 0
-	for i, w := range want {
+	for _, w := range want {
+		if w.Number < 1 || w.Number > s.limits.MaxParts {
+			return CompleteResult{}, ErrInvalidPartNumber
+		}
 		if w.Number <= prev {
 			return CompleteResult{}, ErrInvalidPartOrder
 		}
 		prev = w.Number
-		if w.Number < 1 || w.Number > s.limits.MaxParts {
-			return CompleteResult{}, ErrInvalidPartNumber
-		}
+	}
+
+	selected := make([]Part, 0, len(want))
+	var total int64
+	for i, w := range want {
 		p, ok := byNumber[w.Number]
 		if !ok || !etagMatches(w.ETag, p.ETag) {
 			return CompleteResult{}, ErrInvalidPart

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 // newTestGateway creates a Gateway with a temporary rootDir and httptest server.
@@ -1233,5 +1235,55 @@ func TestAuth_Unauthorized(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestPropfind_HidesReservedDir(t *testing.T) {
+	g, ts := newTestGateway(t, "", "")
+	if err := os.Mkdir(filepath.Join(g.rootDir, gateway.ReservedDirName), 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(g.rootDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	resp := doReq(t, "PROPFIND", ts.URL+"/", "", map[string]string{"Depth": "1"})
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, gateway.ReservedDirName) {
+		t.Fatalf("reserved dir appeared in PROPFIND output: %s", body)
+	}
+	if !strings.Contains(body, "a.txt") {
+		t.Fatalf("regular file missing from PROPFIND output: %s", body)
+	}
+}
+
+func TestAccess_ReservedDirIsDenied(t *testing.T) {
+	g, ts := newTestGateway(t, "", "")
+	reserved := filepath.Join(g.rootDir, gateway.ReservedDirName)
+	if err := os.Mkdir(reserved, 0o700); err != nil {
+		t.Fatalf("create reserved dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reserved, "staged"), []byte("part"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	cases := []struct{ method, path string }{
+		{"PROPFIND", "/" + gateway.ReservedDirName},
+		{http.MethodGet, "/" + gateway.ReservedDirName + "/staged"},
+		{http.MethodDelete, "/" + gateway.ReservedDirName + "/staged"},
+		{http.MethodPut, "/" + gateway.ReservedDirName + "/injected"},
+	}
+	for _, tc := range cases {
+		resp := doReq(t, tc.method, ts.URL+tc.path, "data", nil)
+		body := readBody(t, resp)
+		if resp.StatusCode < 400 {
+			t.Fatalf("%s %s was allowed: status %d, body %s", tc.method, tc.path, resp.StatusCode, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(reserved, "injected")); !os.IsNotExist(err) {
+		t.Fatal("a write into the reserved dir succeeded")
 	}
 }
