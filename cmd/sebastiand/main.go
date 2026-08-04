@@ -40,7 +40,8 @@ func main() {
 	}
 
 	// Clear scratch files left by a previous crash before serving any requests.
-	gateway.SweepTempFiles(cfg.RootDir, logger)
+	// No upload can be in flight yet, so age is irrelevant here.
+	gateway.SweepTempFiles(cfg.RootDir, 0, logger)
 
 	logger.Info("sebastian starting",
 		"root_dir", cfg.RootDir,

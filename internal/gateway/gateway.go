@@ -11,24 +11,49 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
+// ReservedDirName is a top-level directory under rootDir that sebastian reserves
+// for its own state (multipart upload staging). It is not a bucket and is hidden
+// from every gateway: SafePath refuses to resolve into it and directory listings
+// skip it, so clients can neither see nor corrupt in-progress uploads.
+const ReservedDirName = ".sebastian"
+
+// IsReserved reports whether name is the reserved state directory. Gateways call
+// it when filtering the entries of rootDir itself.
+func IsReserved(name string) bool {
+	return name == ReservedDirName
+}
+
 // SweepTempFiles removes stale atomic-write scratch files (".seb-tmp-*" and
-// ".seb-bak-*") left under rootDir by a previous process that died between
-// creating a temp file and renaming it into place. It is safe to call once at
-// startup, when no uploads are in flight.
-func SweepTempFiles(rootDir string, logger *slog.Logger) {
+// ".seb-bak-*") left under rootDir by a process that died between creating a temp
+// file and renaming it into place.
+//
+// Only files last modified more than maxAge ago are removed, so the sweep can run
+// periodically alongside live traffic without destroying an upload that is still
+// streaming. Pass maxAge <= 0 to remove every scratch file regardless of age —
+// correct at startup, when no upload can be in flight.
+func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
+	cutoff := time.Now().Add(-maxAge)
 	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		name := d.Name()
-		if strings.HasPrefix(name, ".seb-tmp-") || strings.HasPrefix(name, ".seb-bak-") {
-			if rmErr := os.Remove(path); rmErr != nil {
-				logger.Warn("failed to remove stale temp file", "path", path, "error", rmErr)
-			} else {
-				logger.Info("removed stale temp file", "path", path)
+		if !strings.HasPrefix(name, ".seb-tmp-") && !strings.HasPrefix(name, ".seb-bak-") {
+			return nil
+		}
+		if maxAge > 0 {
+			info, statErr := d.Info()
+			if statErr != nil || info.ModTime().After(cutoff) {
+				return nil
 			}
+		}
+		if rmErr := os.Remove(path); rmErr != nil {
+			logger.Warn("failed to remove stale temp file", "path", path, "error", rmErr)
+		} else {
+			logger.Info("removed stale temp file", "path", path)
 		}
 		return nil
 	})
@@ -61,6 +86,12 @@ func SafePath(rootDir, reqPath string) (relPath string, fullPath string, err err
 
 	if cleaned == "" {
 		return "", rootDir, nil
+	}
+
+	// The reserved state directory holds sebastian's own bookkeeping (staged
+	// multipart parts); no protocol may read, write, or delete inside it.
+	if cleaned == ReservedDirName || strings.HasPrefix(cleaned, ReservedDirName+"/") {
+		return "", "", fmt.Errorf("reserved path")
 	}
 
 	full := filepath.Join(rootDir, filepath.FromSlash(cleaned))
