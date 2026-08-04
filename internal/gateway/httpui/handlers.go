@@ -79,6 +79,9 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 
 	var dirs, files []os.DirEntry
 	for _, e := range rawEntries {
+		if gateway.IsReservedPath(g.rootDir, filepath.Join(fullPath, e.Name())) {
+			continue
+		}
 		if e.IsDir() {
 			dirs = append(dirs, e)
 		} else {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/solkin/sebastian/internal/gateway"
+	"github.com/solkin/sebastian/internal/multipart"
 )
 
 // Config holds S3 gateway configuration.
@@ -21,22 +22,28 @@ type Config struct {
 	SecretKey      string `yaml:"secret_key"`
 	Domain         string `yaml:"domain"`
 	MaxUploadBytes int64  // max object size for PutObject; 0 = unlimited
+	// Multipart is the staging store backing the multipart upload API. When nil,
+	// multipart operations answer NotImplemented and the rest of the gateway is
+	// unaffected.
+	Multipart *multipart.Store
 }
 
 // Gateway implements the S3-compatible API.
 type Gateway struct {
-	rootDir string
-	config  Config
-	logger  *slog.Logger
-	server  *http.Server
+	rootDir   string
+	config    Config
+	logger    *slog.Logger
+	server    *http.Server
+	multipart *multipart.Store
 }
 
 // New creates a new S3 Gateway.
 func New(rootDir string, cfg Config, logger *slog.Logger) *Gateway {
 	g := &Gateway{
-		rootDir: rootDir,
-		config:  cfg,
-		logger:  logger.With("gateway", "s3"),
+		rootDir:   rootDir,
+		config:    cfg,
+		logger:    logger.With("gateway", "s3"),
+		multipart: cfg.Multipart,
 	}
 
 	mux := http.NewServeMux()
@@ -160,6 +167,10 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if key == "" {
 		query := r.URL.Query()
+		if _, ok := query["uploads"]; ok && r.Method == http.MethodGet {
+			g.handleListMultipartUploads(w, r, bucket)
+			return
+		}
 		if _, ok := query["location"]; ok && r.Method == http.MethodGet {
 			g.handleGetBucketLocation(w, r, bucket)
 			return
@@ -193,6 +204,30 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 		default:
 			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
 		}
+		return
+	}
+
+	// Multipart operations are selected by query parameters on the object URL:
+	// ?uploads starts one, and ?uploadId=... addresses an existing one.
+	query := r.URL.Query()
+	_, initiating := query["uploads"]
+	uploadID := query.Get("uploadId")
+
+	switch {
+	case initiating && r.Method == http.MethodPost:
+		g.handleCreateMultipartUpload(w, r, bucket, key)
+		return
+	case uploadID != "" && r.Method == http.MethodPut:
+		g.handleUploadPart(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodPost:
+		g.handleCompleteMultipartUpload(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodDelete:
+		g.handleAbortMultipartUpload(w, r, bucket, key, uploadID)
+		return
+	case uploadID != "" && r.Method == http.MethodGet:
+		g.handleListParts(w, r, bucket, key, uploadID)
 		return
 	}
 

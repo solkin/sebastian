@@ -26,6 +26,21 @@ func IsReserved(name string) bool {
 	return name == ReservedDirName
 }
 
+// IsReservedPath reports whether fullPath is the reserved state directory of
+// rootDir. Gateways call it while listing an arbitrary directory, where the
+// reserved entry only has to be filtered when that directory is the root.
+func IsReservedPath(rootDir, fullPath string) bool {
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return false
+	}
+	return absPath == filepath.Join(absRoot, ReservedDirName)
+}
+
 // SweepTempFiles removes stale atomic-write scratch files (".seb-tmp-*" and
 // ".seb-bak-*") left under rootDir by a process that died between creating a temp
 // file and renaming it into place.

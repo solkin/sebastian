@@ -18,6 +18,7 @@ import (
 	"github.com/solkin/sebastian/internal/gateway/s3"
 	"github.com/solkin/sebastian/internal/gateway/sftp"
 	"github.com/solkin/sebastian/internal/gateway/webdav"
+	"github.com/solkin/sebastian/internal/multipart"
 )
 
 func main() {
@@ -61,13 +62,35 @@ func main() {
 	var gateways []gateway.Gateway
 	errCh := make(chan error, 4)
 
+	// The multipart staging store is only reachable through the S3 API, but its
+	// janitor also sweeps scratch files written by the other gateways, so it runs
+	// whenever S3 is enabled.
+	var mpStore *multipart.Store
 	if cfg.Gateways.S3.Enabled {
+		store, err := multipart.New(cfg.RootDir, multipart.Limits{
+			MinPartBytes:       cfg.Multipart.MinPartBytes,
+			MaxPartBytes:       cfg.Multipart.MaxPartBytes,
+			MaxParts:           cfg.Multipart.MaxParts,
+			MaxObjectBytes:     cfg.MaxUploadBytes,
+			MaxActiveUploads:   cfg.Multipart.MaxActiveUploads,
+			MaxConcurrentParts: cfg.Multipart.MaxConcurrentPartUploads,
+			UploadTTL:          cfg.Multipart.UploadTTL,
+			CleanupInterval:    cfg.Multipart.CleanupInterval,
+			TempFileMaxAge:     cfg.Multipart.TempFileMaxAge,
+		}, logger)
+		if err != nil {
+			logger.Error("failed to initialize multipart store", "error", err)
+			os.Exit(1)
+		}
+		mpStore = store
+
 		gw := s3.New(cfg.RootDir, s3.Config{
 			ListenAddr:     cfg.Gateways.S3.ListenAddr,
 			AccessKey:      cfg.Gateways.S3.AccessKey,
 			SecretKey:      cfg.Gateways.S3.SecretKey,
 			Domain:         cfg.Gateways.S3.Domain,
 			MaxUploadBytes: cfg.MaxUploadBytes,
+			Multipart:      mpStore,
 		}, logger)
 		gateways = append(gateways, gw)
 	}
@@ -105,6 +128,10 @@ func main() {
 			os.Exit(1)
 		}
 		gateways = append(gateways, gw)
+	}
+
+	if mpStore != nil {
+		go multipart.NewJanitor(mpStore, logger).Run(ctx)
 	}
 
 	for _, gw := range gateways {

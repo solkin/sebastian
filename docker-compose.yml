@@ -1,0 +1,52 @@
+services:
+  sebastian:
+    # Image published by the GH Actions "Docker" workflow (Docker Hub).
+    # Override/pin via SEBASTIAN_IMAGE in .env (e.g. solkin/sebastian:1.2.3).
+    image: ${SEBASTIAN_IMAGE:-solkin/sebastian:latest}
+    container_name: sebastian
+    restart: unless-stopped
+
+    # The container runs as a non-root user, so this UID:GID must own the
+    # bind-mounted data directory on the host (see chown step in the README).
+    user: "1000:1000"
+
+    environment:
+      SEBASTIAN_ROOT_DIR: /data/files
+
+      # --- S3 gateway ---
+      SEBASTIAN_S3_ENABLED: "true"
+      SEBASTIAN_S3_LISTEN_ADDR: ":9200"
+      SEBASTIAN_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
+      SEBASTIAN_S3_SECRET_KEY: "${S3_SECRET_KEY}"
+
+      # --- HTTP UI gateway ---
+      SEBASTIAN_HTTP_ENABLED: "true"
+      SEBASTIAN_HTTP_LISTEN_ADDR: ":9400"
+      SEBASTIAN_HTTP_USERNAME: "${HTTP_USERNAME}"
+      SEBASTIAN_HTTP_PASSWORD: "${HTTP_PASSWORD}"
+
+      # --- Unused gateways, kept explicitly off ---
+      SEBASTIAN_WEBDAV_ENABLED: "false"
+      SEBASTIAN_SFTP_ENABLED: "false"
+
+    volumes:
+      # Host files live directly under /srv/storage/sebastian; each first-level
+      # subdirectory there is an S3 bucket.
+      - /srv/storage/sebastian:/data/files
+
+    # nginx reaches this container over the shared network as
+    # http://sebastian:9400 (UI) and http://sebastian:9200 (S3). No host ports
+    # are published — ingress goes through nginx.
+    networks:
+      - reverseproxy
+
+    # For local debugging without nginx, expose on the loopback instead:
+    # ports:
+    #   - "127.0.0.1:9200:9200"
+    #   - "127.0.0.1:9400:9400"
+
+networks:
+  # Pre-existing network shared with the nginx reverse proxy.
+  # Create it once if missing: docker network create reverseproxy
+  reverseproxy:
+    external: true

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 // maxHandlesPerSession caps the number of simultaneously open file/dir handles a
@@ -297,6 +299,9 @@ func (s *session) handleReaddir(payload []byte) {
 	var body []byte
 	count := 0
 	for _, e := range batch {
+		if gateway.IsReservedPath(s.g.rootDir, filepath.Join(entry.path, e.Name())) {
+			continue
+		}
 		fi, err := e.Info()
 		if err != nil {
 			continue

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/solkin/sebastian/internal/gateway"
 )
 
 // errUploadTooLarge is returned by the COPY copier when the configured upload
@@ -81,6 +83,9 @@ func (g *Gateway) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			for {
 				children, rerr := f.ReadDir(512)
 				for _, child := range children {
+					if gateway.IsReservedPath(g.rootDir, filepath.Join(fullPath, child.Name())) {
+						continue
+					}
 					childRel := child.Name()
 					if relName != "" {
 						childRel = relName + "/" + childRel
