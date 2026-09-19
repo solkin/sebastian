@@ -753,8 +753,8 @@ func TestListObjectsV2_WithStartAfter(t *testing.T) {
 }
 
 func TestListObjectsV2_WithDelimiter(t *testing.T) {
-	g, syncDir := testGateway(t, Config{})
-	bp := filepath.Join(syncDir, "mybucket")
+	g, rootDir := testGateway(t, Config{})
+	bp := filepath.Join(rootDir, "mybucket")
 	os.MkdirAll(filepath.Join(bp, "photos"), 0o755)
 	os.WriteFile(filepath.Join(bp, "root.txt"), []byte("root"), 0o644)
 	os.WriteFile(filepath.Join(bp, "photos", "img.jpg"), []byte("img"), 0o644)
@@ -763,8 +763,8 @@ func TestListObjectsV2_WithDelimiter(t *testing.T) {
 	var result ListBucketResultV2
 	xml.Unmarshal(w.Body.Bytes(), &result)
 
-	if result.KeyCount != 1 {
-		t.Fatalf("expected KeyCount 1, got %d", result.KeyCount)
+	if result.KeyCount != 2 {
+		t.Fatalf("expected KeyCount 2 (one object plus one common prefix), got %d", result.KeyCount)
 	}
 	if len(result.CommonPrefixes) != 1 || result.CommonPrefixes[0].Prefix != "photos/" {
 		t.Fatalf("expected [photos/] in common prefixes, got %v", result.CommonPrefixes)

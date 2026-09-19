@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -195,6 +196,13 @@ func (g *Gateway) multipartReady(w http.ResponseWriter, bucket, key string) (str
 	op, ok := g.objectPath(bucket, key)
 	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
+		return "", false
+	}
+	// Gateways accept a relative root, but the staging store requires an
+	// absolute destination. Preserve its namespace checks while normalizing here.
+	op, err = filepath.Abs(op)
+	if err != nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return "", false
 	}
 	return op, true

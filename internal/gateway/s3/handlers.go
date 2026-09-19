@@ -1,7 +1,10 @@
 package s3
 
 import (
+	"bytes"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -165,7 +168,7 @@ func (g *Gateway) objectPath(bucket, key string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if !isUnderDir(filepath.Join(g.rootDir, bucket), full) {
+	if !gateway.PathResolvesWithin(filepath.Join(g.rootDir, bucket), full) {
 		return "", false
 	}
 	return full, true
@@ -221,13 +224,6 @@ func isHexSHA256(s string) bool {
 		}
 	}
 	return true
-}
-
-// isUnderDir checks that resolved path is within the parent directory.
-func isUnderDir(parent, child string) bool {
-	absParent, _ := filepath.Abs(parent)
-	absChild, _ := filepath.Abs(child)
-	return strings.HasPrefix(absChild, absParent+string(filepath.Separator)) || absChild == absParent
 }
 
 // etagFor returns a deterministic, content-independent ETag derived from a file's
@@ -364,10 +360,18 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 	// Staged parts live outside the bucket directory, so an in-progress upload
 	// leaves the bucket looking empty. Deleting it would strand those parts and
 	// break the client's pending completion.
-	if g.multipart != nil && g.multipart.HasUploads(bucket) {
-		writeS3Error(w, http.StatusConflict, "BucketNotEmpty",
-			"The bucket you tried to delete has in-progress multipart uploads.")
-		return
+	if g.multipart != nil {
+		hasUploads, uploadsErr := g.multipart.HasUploads(bucket)
+		if uploadsErr != nil {
+			g.logger.Error("delete bucket: check multipart uploads failed", "bucket", bucket, "error", uploadsErr)
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+			return
+		}
+		if hasUploads {
+			writeS3Error(w, http.StatusConflict, "BucketNotEmpty",
+				"The bucket you tried to delete has in-progress multipart uploads.")
+			return
+		}
 	}
 
 	if err := os.Remove(bp); err != nil {
@@ -492,6 +496,29 @@ func (g *Gateway) collectObjects(bp, prefix, delimiter string) ([]ObjectInfo, []
 
 		if fi.IsDir() {
 			return nil
+		}
+
+		// Walk reports Lstat metadata for symlinks, while GET and HEAD follow a
+		// safe in-root link. Resolve only link entries so LIST reports the same
+		// size/mtime/ETag as those operations, and omit links that escape rootDir.
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if !gateway.PathResolvesWithin(bp, path) {
+				g.logger.Warn("list objects: skipping symlink outside bucket", "path", path)
+				return nil
+			}
+			rootRel, relErr := filepath.Rel(g.rootDir, path)
+			if relErr != nil {
+				return nil
+			}
+			if _, _, safeErr := gateway.SafePath(g.rootDir, filepath.ToSlash(rootRel)); safeErr != nil {
+				g.logger.Warn("list objects: skipping unsafe symlink", "path", path, "error", safeErr)
+				return nil
+			}
+			resolvedInfo, statErr := os.Stat(path)
+			if statErr != nil || resolvedInfo.IsDir() {
+				return nil
+			}
+			fi = resolvedInfo
 		}
 
 		// A scratch file is a write in flight, not an object: listing it would
@@ -686,7 +713,7 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		Delimiter:             delimiter,
 		MaxKeys:               maxKeys,
 		IsTruncated:           isTruncated,
-		KeyCount:              len(pageObjects),
+		KeyCount:              len(pageObjects) + len(pagePrefixes),
 		Contents:              pageObjects,
 		CommonPrefixes:        pagePrefixes,
 		StartAfter:            startAfter,
@@ -803,6 +830,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// Verify bucket exists.
 	bp, ok := g.bucketPath(bucket)
 	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
@@ -814,21 +842,35 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// Cap the upload size when configured, translating an overflow into 413.
 	if g.config.MaxUploadBytes > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, g.config.MaxUploadBytes)
 	}
 
 	// When the client declares a concrete payload SHA-256 (the value the SigV4
-	// signature is computed over), hash the body as we stream it and reject a
-	// mismatch. This closes the integrity gap where a captured signed request
-	// could be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked
-	// streaming markers carry no verifiable digest, so they are not checked.
+	// signature is computed over), verify the streamed body against it and reject a
+	// mismatch. This closes the integrity gap where a captured signed request could
+	// be replayed with a swapped body. UNSIGNED-PAYLOAD and aws-chunked streaming
+	// markers carry no verifiable digest, so they are not checked.
 	declaredHash := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256")))
 	var hasher hash.Hash
 	if isHexSHA256(declaredHash) {
 		hasher = sha256.New()
 	}
+	declaredMD5 := strings.TrimSpace(r.Header.Get("Content-MD5"))
+	var md5Hasher hash.Hash
+	var wantMD5 []byte
+	if declaredMD5 != "" {
+		wantMD5, err = base64.StdEncoding.DecodeString(declaredMD5)
+		if err != nil || len(wantMD5) != md5.Size {
+			writeS3Error(w, http.StatusBadRequest, "BadDigest",
+				"The Content-MD5 you specified did not match what we received.")
+			return
+		}
+		md5Hasher = md5.New()
+	}
 
+	// Create parent directories if needed.
 	dir := filepath.Dir(op)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		g.logger.Error("put object: mkdir failed", "bucket", bucket, "key", key, "error", err)
@@ -836,6 +878,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// Write to temp file, then rename (atomic write).
 	tmpFile, err := os.CreateTemp(dir, ".seb-tmp-*")
 	if err != nil {
 		g.logger.Error("put object: create temp failed", "bucket", bucket, "key", key, "error", err)
@@ -844,11 +887,14 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	tmpPath := tmpFile.Name()
 
-	var dst io.Writer = tmpFile
+	writers := []io.Writer{tmpFile}
 	if hasher != nil {
-		dst = io.MultiWriter(tmpFile, hasher)
+		writers = append(writers, hasher)
 	}
-	size, err := io.Copy(dst, r.Body)
+	if md5Hasher != nil {
+		writers = append(writers, md5Hasher)
+	}
+	size, err := io.Copy(io.MultiWriter(writers...), r.Body)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
@@ -871,7 +917,15 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 			return
 		}
 	}
+	if md5Hasher != nil && !bytes.Equal(md5Hasher.Sum(nil), wantMD5) {
+		os.Remove(tmpPath)
+		g.logger.Warn("put object: content md5 mismatch", "bucket", bucket, "key", key)
+		writeS3Error(w, http.StatusBadRequest, "BadDigest",
+			"The Content-MD5 you specified did not match what we received.")
+		return
+	}
 
+	// Rename temp file to final path.
 	if err := os.Rename(tmpPath, op); err != nil {
 		os.Remove(tmpPath)
 		g.logger.Error("put object: rename failed", "bucket", bucket, "key", key, "error", err)

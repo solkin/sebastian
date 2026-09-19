@@ -17,11 +17,12 @@ import (
 // gateway, for both the Authorization header form and the presigned query-string
 // form. Legacy SigV2 is intentionally not supported and is rejected by the caller.
 //
-// Limitation: the request body is not re-hashed. The canonical request uses the
-// client-supplied x-amz-content-sha256 value (or UNSIGNED-PAYLOAD) verbatim, as
-// the signing spec requires. This authenticates the requester without buffering
-// the body, so payload integrity is not independently enforced. aws-chunked /
-// streaming-signed bodies are not decoded.
+// Limitation: the request body is not re-hashed here. The canonical request uses
+// the client-supplied x-amz-content-sha256 value (or UNSIGNED-PAYLOAD) verbatim,
+// as the signing spec requires. This authenticates the requester without buffering
+// the body; payload integrity (when the client declares a concrete digest) is
+// enforced separately in handlePutObject. aws-chunked / streaming-signed bodies
+// are not decoded.
 
 const (
 	sigV4Algorithm   = "AWS4-HMAC-SHA256"

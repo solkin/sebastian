@@ -312,7 +312,7 @@ func TestWritePartContentMD5(t *testing.T) {
 	if _, err := s.WritePart(up.ID, 2, bytes.NewReader(payload), Checksums{ContentMD5: base64Std(otherSum[:])}); !errors.Is(err, ErrBadDigest) {
 		t.Fatalf("error = %v, want ErrBadDigest", err)
 	}
-	if _, err := s.WritePart(up.ID, 3, bytes.NewReader(payload), Checksums{ContentMD5: "not base64!!"}); !errors.Is(err, ErrBadDigest) {
+	if _, err := s.WritePart(up.ID, 3, panicReader{}, Checksums{ContentMD5: "not base64!!"}); !errors.Is(err, ErrBadDigest) {
 		t.Fatalf("error = %v, want ErrBadDigest", err)
 	}
 
@@ -323,6 +323,12 @@ func TestWritePartContentMD5(t *testing.T) {
 	if len(parts) != 1 || parts[0].Number != 1 {
 		t.Fatalf("only the verified part should be staged, got %+v", parts)
 	}
+}
+
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) {
+	panic("body must not be read after malformed checksum metadata")
 }
 
 func TestWritePartReplacesSamePartNumber(t *testing.T) {
@@ -645,6 +651,57 @@ func TestListPartsPagination(t *testing.T) {
 	}
 }
 
+func TestRestartRecoveryChoosesNewestDuplicatePart(t *testing.T) {
+	s, root := testStore(t, Limits{})
+	up, err := s.Create("bucket", "obj")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	oldBody := []byte("old")
+	oldPart, err := s.WritePart(up.ID, 1, bytes.NewReader(oldBody), Checksums{})
+	if err != nil {
+		t.Fatalf("write old part: %v", err)
+	}
+	oldPath := filepath.Join(s.uploadDir(up.ID), partFileName(1, oldPart.ETag))
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(oldPath, past, past); err != nil {
+		t.Fatalf("age old part: %v", err)
+	}
+
+	// Simulate a process dying after the replacement rename but before the old
+	// digest-named file was removed.
+	newBody := []byte("replacement")
+	newETag := md5Hex(newBody)
+	newPath := filepath.Join(s.uploadDir(up.ID), partFileName(1, newETag))
+	if err := os.WriteFile(newPath, newBody, 0o600); err != nil {
+		t.Fatalf("write replacement part: %v", err)
+	}
+
+	parts, truncated, _, err := s.ListParts(up.ID, 0, 1000)
+	if err != nil {
+		t.Fatalf("list parts: %v", err)
+	}
+	if truncated || len(parts) != 1 {
+		t.Fatalf("parts=%d truncated=%v, want one recovered part", len(parts), truncated)
+	}
+	if parts[0].ETag != newETag || parts[0].Size != int64(len(newBody)) {
+		t.Fatalf("recovered part = %+v, want replacement etag=%s size=%d", parts[0], newETag, len(newBody))
+	}
+
+	dest := filepath.Join(root, "bucket", "obj")
+	if _, err := s.Complete(up.ID, []CompletePart{{Number: 1, ETag: newETag}}, dest); err != nil {
+		t.Fatalf("complete recovered upload: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read completed object: %v", err)
+	}
+	if !bytes.Equal(got, newBody) {
+		t.Fatalf("completed body = %q, want %q", got, newBody)
+	}
+}
+
 func TestListUploads(t *testing.T) {
 	s, _ := testStore(t, Limits{})
 
@@ -693,8 +750,26 @@ func TestListUploads(t *testing.T) {
 	if len(filtered) != 1 || filtered[0].Key != "a.jpg" {
 		t.Fatalf("prefix filter = %+v", filtered)
 	}
-	if !s.HasUploads("docs") || s.HasUploads("empty") {
+	hasDocs, err := s.HasUploads("docs")
+	if err != nil {
+		t.Fatalf("HasUploads(docs): %v", err)
+	}
+	hasEmpty, err := s.HasUploads("empty")
+	if err != nil {
+		t.Fatalf("HasUploads(empty): %v", err)
+	}
+	if !hasDocs || hasEmpty {
 		t.Fatal("HasUploads did not scope to the bucket")
+	}
+}
+
+func TestHasUploadsDoesNotHideStagingErrors(t *testing.T) {
+	s, _ := testStore(t, Limits{})
+	if err := os.Rename(s.stagingDir, s.stagingDir+"-unavailable"); err != nil {
+		t.Fatalf("hide staging dir: %v", err)
+	}
+	if _, err := s.HasUploads("bucket"); err == nil {
+		t.Fatal("HasUploads treated an unavailable staging area as empty")
 	}
 }
 
@@ -718,6 +793,18 @@ func TestCompleteRejectsDestinationOutsideRoot(t *testing.T) {
 	reserved := filepath.Join(root, gateway.ReservedDirName, "sneaky.bin")
 	if _, err := s.Complete(up.ID, list, reserved); err == nil {
 		t.Fatal("expected completion into the reserved dir to be refused")
+	}
+
+	aliasDir := filepath.Join(root, "bucket")
+	if err := os.Mkdir(aliasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(aliasDir, "state-alias")
+	if err := os.Symlink(filepath.Join(root, gateway.ReservedDirName), alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := s.Complete(up.ID, list, filepath.Join(alias, "sneaky.bin")); err == nil {
+		t.Fatal("expected completion through a symlink into the reserved dir to be refused")
 	}
 }
 
