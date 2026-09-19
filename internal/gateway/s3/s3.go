@@ -165,6 +165,11 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 // routeBucketOrObject handles all bucket-level and object-level operations.
 // Used by both path-style and virtual-hosted-style routing.
 func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if gateway.IsScratchFile(bucket) {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
+
 	if key == "" {
 		query := r.URL.Query()
 		if _, ok := query["uploads"]; ok && r.Method == http.MethodGet {
@@ -205,6 +210,13 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
 		}
 		return
+	}
+
+	for _, segment := range strings.Split(key, "/") {
+		if gateway.IsScratchFile(segment) {
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
+			return
+		}
 	}
 
 	// Multipart operations are selected by query parameters on the object URL:
