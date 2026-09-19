@@ -44,7 +44,7 @@ Sebastian can be configured via a YAML file, environment variables, or both. Env
 
 ```yaml
 root_dir: /data/files
-max_upload_bytes: 0           # cap a single upload (bytes); 0 = unlimited for S3/WebDAV, 1 GiB default for HTTP UI
+max_upload_bytes: 0           # cap a single upload (bytes); 0 = unlimited for S3/WebDAV/SFTP, 1 GiB default for HTTP UI
 
 multipart:                    # S3 multipart upload limits and retention
   min_part_bytes: 5242880     # 5 MiB — minimum size of every part but the last
@@ -86,7 +86,7 @@ gateways:
 | Variable | Description | Default |
 |---|---|---|
 | `SEBASTIAN_ROOT_DIR` | Root directory to serve | `/data/files` |
-| `SEBASTIAN_MAX_UPLOAD_BYTES` | Max size of a single upload in bytes (`0` = unlimited for S3/WebDAV; HTTP UI defaults to 1 GiB) | `0` |
+| `SEBASTIAN_MAX_UPLOAD_BYTES` | Max size of a single upload in bytes (`0` = unlimited for S3/WebDAV/SFTP; HTTP UI defaults to 1 GiB) | `0` |
 | `SEBASTIAN_MULTIPART_MIN_PART_BYTES` | Minimum size of every multipart part but the last | `5242880` (5 MiB) |
 | `SEBASTIAN_MULTIPART_MAX_PART_BYTES` | Maximum size of a single multipart part | `5368709120` (5 GiB) |
 | `SEBASTIAN_MULTIPART_MAX_PARTS` | Highest accepted part number | `10000` |
@@ -115,6 +115,14 @@ gateways:
 | `SEBASTIAN_SFTP_HOST_KEY_PATH` | Path to server identity key file (required, auto-generated on first run) | |
 
 At least one gateway must be enabled. When SFTP is enabled, `host_key_path` must be explicitly set.
+
+### Upload limit defaults
+
+Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
+uploads. Explicit `0` disables this cap in either YAML or the environment;
+environment values override YAML. Negative YAML upload limits are rejected.
+`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
+browser retains its 1 GiB default request limit.
 
 ### SFTP Notes
 
@@ -214,6 +222,10 @@ plain `PUT`). Clients that compare a stored multipart ETag against a later `HEAD
 will see a difference; nothing in the AWS SDKs' upload or download paths depends
 on it.
 
+Plain `PutObject` also validates `Content-MD5` and a concrete
+`x-amz-content-sha256`. A checksum mismatch rejects the upload without replacing
+an existing object.
+
 ## S3 Authentication
 
 When `access_key`/`secret_key` are set, requests must be signed with AWS Signature
@@ -249,6 +261,9 @@ go build -o sebastiand ./cmd/sebastiand
 
 ## Testing
 
+See the [protocol parity contract](docs/protocol-parity.md) for shared behavior,
+intentional differences, and the rules for porting protocol fixes.
+
 ```bash
 go test -race ./...
 ```
@@ -256,11 +271,3 @@ go test -race ./...
 ## License
 
 MIT
-
-### Upload limit defaults
-
-Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
-uploads. Explicit `0` disables this cap in either YAML or the environment;
-environment values override YAML. Negative YAML upload limits are rejected.
-`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
-browser retains its 1 GiB default request limit.
