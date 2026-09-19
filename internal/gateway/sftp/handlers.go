@@ -277,49 +277,58 @@ func (s *session) handleReaddir(payload []byte) {
 		return
 	}
 
-	// Read the next bounded batch directly from the open directory handle, which
-	// tracks its own read position. This streams large directories incrementally
-	// instead of buffering the entire listing in memory.
-	s.mu.Lock()
-	entry, ok := s.handles[handle]
-	if !ok || !entry.isDir || entry.dir == nil {
+	for {
+		// Read the next bounded batch directly from the open directory handle, which
+		// tracks its own read position. This streams large directories incrementally
+		// instead of buffering the entire listing in memory.
+		s.mu.Lock()
+		entry, ok := s.handles[handle]
+		if !ok || !entry.isDir || entry.dir == nil {
+			s.mu.Unlock()
+			s.sendStatus(id, sshFxFailure, "invalid handle")
+			return
+		}
+		batch, rerr := entry.dir.ReadDir(readdirBatchSize)
 		s.mu.Unlock()
-		s.sendStatus(id, sshFxFailure, "invalid handle")
-		return
-	}
-	batch, rerr := entry.dir.ReadDir(readdirBatchSize)
-	s.mu.Unlock()
-	if rerr != nil && rerr != io.EOF {
-		s.sendStatus(id, sshFxFailure, "read failed")
-		return
-	}
+		if rerr != nil && rerr != io.EOF {
+			s.sendStatus(id, sshFxFailure, "read failed")
+			return
+		}
 
-	// Marshal into a temporary buffer first so the entry count reflects only the
-	// entries we actually emit (an entry may vanish between ReadDir and Info).
-	var body []byte
-	count := 0
-	for _, e := range batch {
-		if gateway.IsReservedPath(s.g.rootDir, filepath.Join(entry.path, e.Name())) {
+		// Marshal into a temporary buffer first so the entry count reflects only the
+		// entries we actually emit. Reserved files are filtered per
+		// batch, and an entry may vanish between ReadDir and Info.
+		var body []byte
+		count := 0
+		for _, e := range batch {
+			if !gateway.IsClientVisiblePath(s.g.rootDir, filepath.Join(entry.path, e.Name())) {
+				continue
+			}
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			body = marshalFileInfo(body, e.Name(), fi)
+			count++
+		}
+
+		// A hidden batch is not EOF. Keep reading bounded batches until a visible
+		// entry or the actual end of the directory is reached.
+		if count == 0 {
+			if rerr == io.EOF {
+				s.sendStatus(id, sshFxEOF, "")
+				return
+			}
 			continue
 		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		body = marshalFileInfo(body, e.Name(), fi)
-		count++
-	}
 
-	if count == 0 {
-		s.sendStatus(id, sshFxEOF, "")
+		var resp []byte
+		resp = marshalUint32(resp, id)
+		resp = marshalUint32(resp, uint32(count))
+		resp = append(resp, body...)
+		writePacket(s.ch, sshFxpName, resp)
 		return
 	}
-
-	var resp []byte
-	resp = marshalUint32(resp, id)
-	resp = marshalUint32(resp, uint32(count))
-	resp = append(resp, body...)
-	writePacket(s.ch, sshFxpName, resp)
 }
 
 func (s *session) handleOpen(payload []byte) {

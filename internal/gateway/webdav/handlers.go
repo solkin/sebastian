@@ -83,7 +83,7 @@ func (g *Gateway) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			for {
 				children, rerr := f.ReadDir(512)
 				for _, child := range children {
-					if gateway.IsReservedPath(g.rootDir, filepath.Join(fullPath, child.Name())) {
+					if !gateway.IsClientVisiblePath(g.rootDir, filepath.Join(fullPath, child.Name())) {
 						continue
 					}
 					childRel := child.Name()
