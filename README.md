@@ -256,3 +256,11 @@ go test -race ./...
 ## License
 
 MIT
+
+### Upload limit defaults
+
+Omitting `multipart.max_active_uploads` limits the server to 10,000 staged
+uploads. Explicit `0` disables this cap in either YAML or the environment;
+environment values override YAML. Negative YAML upload limits are rejected.
+`max_upload_bytes: 0` leaves S3, WebDAV, and SFTP uploads unlimited; the HTTP
+browser retains its 1 GiB default request limit.

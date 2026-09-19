@@ -246,8 +246,11 @@ gateways:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	// Unset multipart fields stay zero; the store resolves them to the
-	// S3-compatible defaults so there is one source of truth.
+	// An omitted active-upload limit is finite; explicit zero stays unlimited.
+	if cfg.Multipart.MaxActiveUploads != 10000 {
+		t.Fatalf("max_active_uploads = %d, want 10000", cfg.Multipart.MaxActiveUploads)
+	}
+	cfg.Multipart.MaxActiveUploads = 0
 	if cfg.Multipart != (MultipartConfig{}) {
 		t.Fatalf("expected zero multipart config, got %+v", cfg.Multipart)
 	}

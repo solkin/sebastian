@@ -16,7 +16,7 @@ import (
 type Config struct {
 	RootDir string `yaml:"root_dir"`
 	// MaxUploadBytes caps the size of a single uploaded object/file across the S3,
-	// WebDAV, and HTTP UI gateways. 0 means unlimited.
+	// WebDAV, SFTP, and HTTP UI gateways. 0 means unlimited.
 	MaxUploadBytes int64           `yaml:"max_upload_bytes"`
 	Multipart      MultipartConfig `yaml:"multipart"`
 	Gateways       Gateways        `yaml:"gateways"`
@@ -92,7 +92,8 @@ type SFTPConfig struct {
 // Load reads configuration from a YAML file, applies environment variable
 // overrides, and sets defaults.
 func Load(path string) (*Config, error) {
-	cfg := &Config{}
+	// Seed this default before YAML parsing: an explicit zero means unlimited.
+	cfg := &Config{Multipart: MultipartConfig{MaxActiveUploads: 10000}}
 
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -131,9 +132,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Gateways.SFTP.ListenAddr = ":9500"
 	}
 
-	// Unset multipart fields stay zero and are resolved to the S3-compatible
-	// defaults by the multipart store, so there is a single source of truth for
-	// them.
+	// Other unset multipart fields are resolved by the multipart store.
 }
 
 func applyEnv(cfg *Config) {
@@ -236,6 +235,10 @@ func validate(cfg *Config) error {
 
 	if cfg.Gateways.SFTP.Enabled && cfg.Gateways.SFTP.HostKeyPath == "" {
 		return fmt.Errorf("sftp.host_key_path is required when SFTP gateway is enabled")
+	}
+
+	if cfg.MaxUploadBytes < 0 {
+		return fmt.Errorf("max_upload_bytes must not be negative")
 	}
 
 	m := cfg.Multipart
