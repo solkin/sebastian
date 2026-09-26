@@ -233,26 +233,11 @@ func resolveNoSymlinkEscape(rootDir, full string) (resolvedPath, realRoot string
 		return absFull, absRoot, false, nil
 	}
 
-	cur := absFull
-	rest := ""
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			if rest != "" {
-				resolved = filepath.Join(resolved, rest)
-			}
-			if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
-				return "", realRoot, true, fmt.Errorf("path traversal")
-			}
-			return resolved, realRoot, true, nil
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			// Reached the filesystem root without resolving; the textual check stands.
-			return absFull, realRoot, true, nil
-		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
+	resolved := evalDeepestAncestor(absFull)
+	if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+		return "", realRoot, true, fmt.Errorf("path traversal")
 	}
+	return resolved, realRoot, true, nil
 }
 
 // CheckBasicAuth validates HTTP Basic Auth credentials.
