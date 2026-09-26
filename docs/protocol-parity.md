@@ -18,8 +18,10 @@ listed explicitly below.
 | Reserved state | Only the root-level state directory is reserved; the same directory name inside an ordinary bucket remains user data. Requests also validate resolved symlink targets. | Gateway namespace tests; `TestNestedStateDirectoryIsAnOrdinaryObjectPrefix` |
 | Scratch files and directories | Temporary and backup names at any depth are rejected in client paths and omitted from listings, including S3 prefixes and buckets. | Namespace tests in all four gateways; `TestListHidesScratchDirectories` |
 | S3 symlinks | Object paths must remain inside their bucket. Safe file aliases have matching LIST/HEAD metadata; unsafe aliases are omitted. | S3 parity tests |
-| S3 checksums | PUT and UploadPart validate declared Content-MD5 and concrete SHA-256 digests; a rejected PUT preserves the existing object. | S3 checksum tests; multipart checksum tests |
+| S3 checksums | PUT, UploadPart, and DeleteObjects validate declared Content-MD5 and concrete SHA-256 digests; a rejected PUT preserves the existing object, and a rejected DeleteObjects deletes nothing. | S3 checksum tests; multipart checksum tests; `TestDeleteObjects_Digests` |
 | S3 listing | V1/V2 pagination is stable; V2 KeyCount includes returned objects and CommonPrefixes. Path and virtual-host routing apply the same namespace restrictions. | S3 listing tests; `TestScratchRoutingMatchesAddressStyles` |
+| S3 batch delete | DeleteObjects takes up to 1000 keys and deletes each exactly as DeleteObject does: a missing key counts as deleted and a directory key removes nothing. A key over 1024 bytes (KeyTooLongError), one the object API refuses, or one that cannot be stat'ed (InternalError) is reported without failing the rest. `Quiet` omits deleted keys; a missing bucket is NoSuchBucket; an empty, malformed, over-1000-key, or over-8-MiB request is MalformedXML. | DeleteObjects tests |
+| S3 startup buckets | Buckets listed in `gateways.s3.buckets` (or the comma-separated `*_S3_BUCKETS` variable) are created before the gateways start when missing; existing buckets are left as they are, and a name that cannot be a bucket stops startup. | `TestCreateBuckets`; `TestCreateBuckets_RefusesWhatCannotBeABucket`; `TestLoad_S3Buckets` |
 | Multipart recovery | Parts survive restart. Duplicate part versions left by a crash resolve to one newest part, with deterministic tie-breaking. Completion verifies parts before publication. | `TestRestartRecoveryChoosesNewestDuplicatePart`; multipart integrity tests |
 | Multipart isolation | Staging is hidden from gateways. The store rejects unsafe destinations, and unavailable staging prevents bucket deletion. | Multipart path tests; `TestParity_DeleteBucketUnavailableStaging` |
 | Upload limits | Omitted active-upload cap is 10,000; explicit YAML/environment zero is unlimited. Environment overrides YAML. Negative YAML limits are rejected. | `TestUploadLimitContract` |
@@ -39,7 +41,7 @@ COPY skips symlinks found inside the source tree.
 | Storage setting | `sync_dir`, default `./sync` | `root_dir`, default `/data/files` |
 | Replication | Peers, watcher, SQLite metadata, repair/reconciliation | None |
 | Ignore rules | Shared with node synchronization and applied to gateways | No user ignore rules |
-| Empty parent directories | Sync-aware cleanup after relevant delete/move operations | Preserved until explicitly removed |
+| Empty parent directories | Sync-aware cleanup after relevant delete/move operations, DeleteObjects included; a running node also removes a bucket left empty | Preserved until explicitly removed |
 | Reserved state | `.birak/` | `.sebastian/` |
 | Scratch names | `.birak-tmp-*`, `.birak-bak-*` | `.seb-tmp-*`, `.seb-bak-*` |
 | SSH host-key default | Generated in `meta_dir` unless overridden | Explicit `host_key_path` required; generated there when absent |
@@ -49,7 +51,9 @@ COPY skips symlinks found inside the source tree.
 
 Birak's `TestMultipartReplicationPublishesOnlyCompletedObject` additionally
 checks that staging is neither indexed nor replicated and only the completed
-object arrives at a peer. These node-specific tests belong only to Birak.
+object arrives at a peer, and `TestDeleteObjectsReplicatesEveryDeletion` that
+every deletion of a batch reaches a peer. These node-specific tests belong only
+to Birak.
 
 ## Maintaining parity
 
