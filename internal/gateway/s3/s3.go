@@ -126,7 +126,7 @@ func (g *Gateway) extractBucketFromHost(host string) string {
 // Path-style:
 //
 //	/              → ListBuckets
-//	/{bucket}      → bucket operations (HEAD/GET/PUT/DELETE)
+//	/{bucket}      → bucket operations (HEAD/GET/PUT/DELETE; POST ?delete deletes objects)
 //	/{bucket}/{key} → object operations (HEAD/GET/PUT/DELETE)
 //
 // Virtual-hosted-style (bucket in Host header subdomain):
@@ -194,6 +194,10 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 		}
 		if _, ok := query["policy"]; ok && r.Method == http.MethodGet {
 			writeS3Error(w, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist.")
+			return
+		}
+		if _, ok := query["delete"]; ok && r.Method == http.MethodPost {
+			g.handleDeleteObjects(w, r, bucket)
 			return
 		}
 

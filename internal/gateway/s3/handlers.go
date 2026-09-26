@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/solkin/sebastian/internal/gateway"
 )
@@ -107,6 +109,40 @@ type LocationConstraint struct {
 type VersioningConfiguration struct {
 	XMLName xml.Name `xml:"VersioningConfiguration"`
 	Xmlns   string   `xml:"xmlns,attr"`
+}
+
+// DeleteObjectsRequest is the body of a DeleteObjects request.
+type DeleteObjectsRequest struct {
+	XMLName xml.Name              `xml:"Delete"`
+	Quiet   bool                  `xml:"Quiet"`
+	Objects []DeleteObjectsObject `xml:"Object"`
+}
+
+// DeleteObjectsObject names one object to delete; a VersionId is ignored, as
+// buckets are not versioned.
+type DeleteObjectsObject struct {
+	Key string `xml:"Key"`
+}
+
+// DeleteObjectsResult is the response for DeleteObjects: the keys deleted
+// (unless the request was quiet) and the keys that could not be.
+type DeleteObjectsResult struct {
+	XMLName xml.Name            `xml:"DeleteResult"`
+	Xmlns   string              `xml:"xmlns,attr"`
+	Deleted []DeletedObject     `xml:"Deleted"`
+	Errors  []DeleteObjectError `xml:"Error"`
+}
+
+// DeletedObject is a key DeleteObjects deleted.
+type DeletedObject struct {
+	Key string `xml:"Key"`
+}
+
+// DeleteObjectError is a key DeleteObjects could not delete, and why.
+type DeleteObjectError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
 }
 
 // ObjectInfo represents a single object in a listing.
@@ -311,22 +347,41 @@ func (g *Gateway) handleCreateBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	info, err := os.Stat(bp)
-	if err == nil && info.IsDir() {
-		w.Header().Set("Location", "/"+bucket)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if err := os.Mkdir(bp, 0o755); err != nil {
+	if err := g.createBucket(bucket, bp); err != nil {
 		g.logger.Error("create bucket failed", "bucket", bucket, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create bucket")
 		return
 	}
 
-	g.logger.Info("bucket created", "bucket", bucket)
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
+}
+
+// createBucket makes the directory of a bucket unless it exists already.
+func (g *Gateway) createBucket(bucket, bp string) error {
+	if info, err := os.Stat(bp); err == nil && info.IsDir() {
+		return nil
+	}
+	if err := os.Mkdir(bp, 0o755); err != nil {
+		return err
+	}
+	g.logger.Info("bucket created", "bucket", bucket)
+	return nil
+}
+
+// CreateBuckets makes the named buckets that do not exist yet, so that they are
+// there before the first request. A name that cannot be a bucket is an error.
+func (g *Gateway) CreateBuckets(buckets []string) error {
+	for _, bucket := range buckets {
+		bp, ok := g.bucketPath(bucket)
+		if !validateBucketName(bucket) || !ok {
+			return fmt.Errorf("invalid bucket name %q", bucket)
+		}
+		if err := g.createBucket(bucket, bp); err != nil {
+			return fmt.Errorf("create bucket %q: %w", bucket, err)
+		}
+	}
+	return nil
 }
 
 // handleDeleteBucket deletes an empty bucket.
@@ -950,28 +1005,133 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 
 // handleDeleteObject deletes an object from the bucket.
 func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if !validateBucketName(bucket) || !validateKey(key) {
+	if !validateBucketName(bucket) {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid argument")
 		return
 	}
+	if failure := g.deleteObject(bucket, key); failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
+// objectFailure is why one object could not be deleted: the status and S3 error
+// DeleteObject answers with, of which DeleteObjects reports the error.
+type objectFailure struct {
+	status        int
+	code, message string
+}
+
+// deleteObject deletes one object of a bucket, for DeleteObject and
+// DeleteObjects alike; nil means the key is gone.
+func (g *Gateway) deleteObject(bucket, key string) *objectFailure {
+	if !validateKey(key) {
+		return &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid argument"}
+	}
 	op, ok := g.objectPath(bucket, key)
 	if !ok {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
-		return
+		return &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid key"}
 	}
 
 	// Only a regular file is an object. Deleting a missing key is a success no-op
 	// in S3, and a key that resolves to a directory must not be removed via the
 	// object API (os.Remove on a non-empty directory would otherwise return 500).
-	if info, err := os.Stat(op); err == nil && !info.IsDir() {
+	// A key that cannot even be looked at may still be there, so that is a failure.
+	info, err := os.Stat(op)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ENAMETOOLONG) {
+			return nil
+		}
+		g.logger.Error("delete object: stat failed", "bucket", bucket, "key", key, "error", err)
+		return &objectFailure{http.StatusInternalServerError, "InternalError", "Failed to delete object"}
+	}
+	if !info.IsDir() {
 		if rmErr := os.Remove(op); rmErr != nil && !os.IsNotExist(rmErr) {
 			g.logger.Error("delete object failed", "bucket", bucket, "key", key, "error", rmErr)
-			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to delete object")
-			return
+			return &objectFailure{http.StatusInternalServerError, "InternalError", "Failed to delete object"}
 		}
 		g.logger.Info("object deleted", "bucket", bucket, "key", key)
 	}
+	return nil
+}
 
-	w.WriteHeader(http.StatusNoContent)
+// maxDeleteObjectsKeys is how many keys one DeleteObjects request may name, and
+// maxKeyLength how long each may be, in bytes, as in S3. Resolving a key costs
+// more the longer it is, so the limits bound the work of one request.
+const (
+	maxDeleteObjectsKeys = 1000
+	maxKeyLength         = 1024
+)
+
+// maxDeleteObjectsBody bounds the body of a DeleteObjects request: a thousand
+// keys of S3's longest, 1024 bytes each, fit even with every character escaped.
+const maxDeleteObjectsBody = 8 << 20
+
+// handleDeleteObjects deletes many objects of a bucket in one request, each as
+// DeleteObject would: a missing key counts as deleted, and a key that cannot be
+// deleted is reported in the result without failing the others.
+func (g *Gateway) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !validateBucketName(bucket) {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+		return
+	}
+	if info, err := os.Stat(bp); os.IsNotExist(err) || (err == nil && !info.IsDir()) {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
+		return
+	} else if err != nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxDeleteObjectsBody))
+	if err != nil {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML",
+			"The XML you provided was not well-formed or did not validate against our published schema.")
+		return
+	}
+	// The body names what to delete, so it is held to its declared digests just
+	// as an object's body is: a captured signed request cannot be replayed with
+	// other keys.
+	if declared := strings.TrimSpace(r.Header.Get("Content-MD5")); declared != "" {
+		want, err := base64.StdEncoding.DecodeString(declared)
+		if sum := md5.Sum(body); err != nil || !bytes.Equal(sum[:], want) {
+			writeS3Error(w, http.StatusBadRequest, "BadDigest",
+				"The Content-MD5 you specified did not match what we received.")
+			return
+		}
+	}
+	if declared := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256"))); isHexSHA256(declared) {
+		if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != declared {
+			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+				"The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
+	}
+
+	var request DeleteObjectsRequest
+	if err := xml.Unmarshal(body, &request); err != nil || len(request.Objects) == 0 || len(request.Objects) > maxDeleteObjectsKeys {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML",
+			"The XML you provided was not well-formed or did not validate against our published schema.")
+		return
+	}
+
+	result := DeleteObjectsResult{Xmlns: s3Xmlns}
+	for _, object := range request.Objects {
+		failure := &objectFailure{http.StatusBadRequest, "KeyTooLongError", "Your key is too long"}
+		if len(object.Key) <= maxKeyLength {
+			failure = g.deleteObject(bucket, object.Key)
+		}
+		if failure != nil {
+			result.Errors = append(result.Errors, DeleteObjectError{Key: object.Key, Code: failure.code, Message: failure.message})
+		} else if !request.Quiet {
+			result.Deleted = append(result.Deleted, DeletedObject{Key: object.Key})
+		}
+	}
+	writeXML(w, http.StatusOK, result)
 }

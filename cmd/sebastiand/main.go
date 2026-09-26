@@ -92,6 +92,10 @@ func main() {
 			MaxUploadBytes: cfg.MaxUploadBytes,
 			Multipart:      mpStore,
 		}, logger)
+		if err := gw.CreateBuckets(cfg.Gateways.S3.Buckets); err != nil {
+			logger.Error("failed to create buckets", "error", err)
+			os.Exit(1)
+		}
 		gateways = append(gateways, gw)
 	}
 

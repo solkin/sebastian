@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,6 +103,32 @@ gateways:
 	}
 	if cfg.Gateways.S3.ListenAddr != ":7200" {
 		t.Fatalf("expected :7200, got %s", cfg.Gateways.S3.ListenAddr)
+	}
+}
+
+func TestLoad_S3Buckets(t *testing.T) {
+	path := writeYAML(t, `
+root_dir: /tmp/test
+gateways:
+  s3:
+    enabled: true
+    buckets: [files, backups]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := strings.Join(cfg.Gateways.S3.Buckets, ","); got != "files,backups" {
+		t.Fatalf("expected files,backups from YAML, got %q", got)
+	}
+
+	t.Setenv("SEBASTIAN_S3_BUCKETS", " media, ,backups ,")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := strings.Join(cfg.Gateways.S3.Buckets, ","); got != "media,backups" {
+		t.Fatalf("expected media,backups from env, got %q", got)
 	}
 }
 

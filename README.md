@@ -6,7 +6,7 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 
 ## Features
 
-- **S3-compatible API** — path-style and virtual-hosted-style addressing, ListBuckets, GetObject, PutObject, DeleteObject, ListObjectsV1/V2
+- **S3-compatible API** — path-style and virtual-hosted-style addressing, ListBuckets, GetObject, PutObject, DeleteObject, DeleteObjects, ListObjectsV1/V2
 - **S3 multipart uploads** — CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads; crash-safe staging, TTL cleanup, and per-part checksums
 - **WebDAV** — full PROPFIND/GET/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK support, compatible with macOS Finder, Windows Explorer, Cyberduck, rclone
 - **SFTP** — SSH File Transfer Protocol v3, compatible with OpenSSH sftp, FileZilla, WinSCP
@@ -63,6 +63,7 @@ gateways:
     access_key: ""
     secret_key: ""
     domain: ""
+    buckets: []               # created at startup when missing
   webdav:
     enabled: false
     listen_addr: ":9300"
@@ -100,6 +101,7 @@ gateways:
 | `SEBASTIAN_S3_ACCESS_KEY` | S3 access key (empty = no auth) | |
 | `SEBASTIAN_S3_SECRET_KEY` | S3 secret key | |
 | `SEBASTIAN_S3_DOMAIN` | Base domain for virtual-hosted-style S3 (empty = path-style only) | |
+| `SEBASTIAN_S3_BUCKETS` | Comma-separated buckets to create at startup when missing | |
 | `SEBASTIAN_WEBDAV_ENABLED` | Enable WebDAV gateway | `false` |
 | `SEBASTIAN_WEBDAV_LISTEN_ADDR` | WebDAV listen address | `:9300` |
 | `SEBASTIAN_WEBDAV_USERNAME` | WebDAV username (empty = no auth) | |
@@ -159,6 +161,21 @@ root_dir/
 `root_dir/.sebastian/` is reserved for sebastian's own state (multipart staging).
 It is not a bucket, is hidden from every gateway's listings, and cannot be read or
 written through any protocol.
+
+Buckets listed in `buckets` (`SEBASTIAN_S3_BUCKETS`) are created at startup when
+missing, so they exist before a client that does not create buckets, such as a
+backup tool, first uses one. A name that cannot be a bucket stops startup.
+
+## S3 Batch Deletes
+
+DeleteObjects (`POST /{bucket}?delete`) deletes up to 1000 keys in one request,
+each exactly as DeleteObject would: a missing key counts as deleted, a key naming
+a directory removes nothing, and emptied parent directories stay. A key that
+cannot be deleted — longer than S3's 1024 bytes, outside the bucket, or one the
+server cannot look at — is reported in the result without failing the others;
+`Quiet` leaves the deleted keys out. `Content-MD5` and a concrete `x-amz-content-sha256`
+are enforced when present, so a captured signed request cannot be replayed with
+other keys. `VersionId` is ignored, as buckets are not versioned.
 
 ## S3 Multipart Uploads
 

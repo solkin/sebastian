@@ -62,6 +62,9 @@ type S3Config struct {
 	AccessKey  string `yaml:"access_key"`
 	SecretKey  string `yaml:"secret_key"`
 	Domain     string `yaml:"domain"`
+	// Buckets are created at startup when missing, so that they exist before a
+	// client that cannot create them, or should not, first asks for them.
+	Buckets []string `yaml:"buckets"`
 }
 
 // WebDAVConfig holds WebDAV gateway settings.
@@ -159,6 +162,10 @@ func applyEnv(cfg *Config) {
 		}
 	}
 
+	if v := os.Getenv("SEBASTIAN_S3_BUCKETS"); v != "" {
+		cfg.Gateways.S3.Buckets = splitList(v)
+	}
+
 	envBoolMap := map[string]*bool{
 		"SEBASTIAN_S3_ENABLED":     &cfg.Gateways.S3.Enabled,
 		"SEBASTIAN_WEBDAV_ENABLED": &cfg.Gateways.WebDAV.Enabled,
@@ -214,6 +221,18 @@ func applyEnv(cfg *Config) {
 			}
 		}
 	}
+}
+
+// splitList reads a comma-separated list, dropping blanks around and between
+// its items.
+func splitList(s string) []string {
+	var items []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func parseBool(s string) bool {
