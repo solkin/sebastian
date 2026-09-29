@@ -11,7 +11,8 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 - **WebDAV** — full PROPFIND/GET/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK support, compatible with macOS Finder, Windows Explorer, Cyberduck, rclone
 - **SFTP** — SSH File Transfer Protocol v3, compatible with OpenSSH sftp, FileZilla, WinSCP
 - **HTTP UI** — Material 3 styled web file browser with upload, download, rename, delete, drag-and-drop folder upload
-- **Atomic writes** — all file writes use temp file + rename for consistency
+- **Durable atomic uploads** — HTTP, WebDAV PUT and S3 publish flushed temporary files by rename; SFTP writes directly to open files
+- **Recoverable COPY/MOVE** — private copy staging and filesystem journals preserve replaced data across process crashes
 - **Path traversal protection** — three-layer defense (textual check + absolute path verification + symlink-escape resolution), applied uniformly across all gateways
 
 ## Quick Start
@@ -288,3 +289,28 @@ go test -race ./...
 ## License
 
 MIT
+
+## Filesystem reliability
+
+HTTP, WebDAV PUT and S3 uploads flush their file and changed parent directories
+before acknowledging publication on filesystems that support directory flushing.
+Windows retains file flushing with best effort directory durability. WebDAV COPY first builds an unpublished copy;
+COPY/MOVE replacement journals under `.sebastian/transactions/` let startup roll
+back an interrupted replacement or finish cleanup of a committed one. Recovery
+checks object identities and checksums, preserves unexpected offline edits, and
+stops startup when it cannot safely recover. Keep the journals and backup files;
+finish pending operations before upgrading or backing up the volume. Old
+`.seb-bak-*` files without journals require explicit restoration before startup.
+
+Run one daemon per root directory: a process lease rejects a second instance.
+The scratch janitor keeps active uploads even with old modification times and
+never deletes recovery backups. SFTP preserves direct filesystem semantics:
+writes are immediately visible, disconnect retains partial writes, and append
+ignores the client offset. Writable CLOSE flushes the file; SFTP does not stage
+a replacement generation or break hard links. External filesystem writers do
+not take the gateway namespace lock; avoid editing paths involved in an active
+COPY/MOVE or recovery operation.
+
+Logging uses a bounded asynchronous queue. A stalled output consumer does not
+block requests; overflow drops log records. Tagged Docker releases run tests
+with the race detector and `go vet` before publishing an image.

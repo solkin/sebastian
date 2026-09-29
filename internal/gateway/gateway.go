@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/solkin/sebastian/internal/fileops"
 )
 
 // Gateway is an interface that each protocol-specific file access server must implement.
@@ -113,21 +115,38 @@ func IsScratchFile(name string) bool {
 	return strings.HasPrefix(name, tempFilePrefix) || strings.HasPrefix(name, backupFilePrefix)
 }
 
-// SweepTempFiles removes stale atomic-write scratch files (".seb-tmp-*" and
-// ".seb-bak-*") left under rootDir by a process that died between creating a temp
-// file and renaming it into place.
-//
-// Only files last modified more than maxAge ago are removed, so the sweep can run
-// periodically alongside live traffic without destroying an upload that is still
-// streaming. Pass maxAge <= 0 to remove every scratch file regardless of age —
-// correct at startup, when no upload can be in flight.
+// SweepTempFiles removes inactive temporary files and COPY stages.
+// Recovery backups are preserved, and pending journals defer all cleanup.
 func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
+	unlock := fileops.Lock(rootDir)
+	defer unlock()
+	if pending, err := fileops.ReplacementPendingLocked(rootDir); err != nil || pending {
+		logger.Debug("defer scratch cleanup until replacement recovery completes", "error", err)
+		return
+	}
 	cutoff := time.Now().Add(-maxAge)
 	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return nil
 		}
-		if !IsScratchFile(d.Name()) {
+		if d.IsDir() {
+			// COPY staging is private and only disposable without a journal.
+			// The root lock excludes an active builder for the entire sweep.
+			if strings.HasPrefix(d.Name(), ".seb-tmp-replace-") {
+				info, statErr := d.Info()
+				if statErr == nil && (maxAge <= 0 || !info.ModTime().After(cutoff)) {
+					if err := os.RemoveAll(path); err != nil {
+						logger.Warn("failed to remove orphan COPY stage", "path", path, "error", err)
+					}
+				}
+				return fs.SkipDir
+			}
+			if strings.HasPrefix(d.Name(), backupFilePrefix) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasPrefix(d.Name(), tempFilePrefix) || fileops.ScratchActive(path) {
 			return nil
 		}
 		if maxAge > 0 {

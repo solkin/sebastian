@@ -3,6 +3,7 @@ package sftp
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/solkin/sebastian/internal/fileops"
 	"github.com/solkin/sebastian/internal/gateway"
 )
 
@@ -22,10 +24,12 @@ import (
 const maxHandlesPerSession = 1024
 
 type handleEntry struct {
-	path  string
-	file  *os.File // regular-file handle (SSH_FXP_OPEN)
-	dir   *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
-	isDir bool
+	path       string
+	appendMode bool
+	writable   bool
+	file       *os.File // regular-file handle (SSH_FXP_OPEN)
+	dir        *os.File // directory handle (SSH_FXP_OPENDIR), read incrementally
+	isDir      bool
 }
 
 type session struct {
@@ -381,13 +385,18 @@ func (s *session) handleOpen(payload []byte) {
 
 	if pflags&sshFxfCreat != 0 {
 		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := fileops.Mkdir(s.g.rootDir, dir, 0o755, true); err != nil {
 			s.sendStatus(id, sshFxFailure, "mkdir failed")
 			return
 		}
 	}
 
-	f, err := os.OpenFile(fullPath, flag, 0o644)
+	var f *os.File
+	err = fileops.Do(s.g.rootDir, func() error {
+		var openErr error
+		f, openErr = os.OpenFile(fullPath, flag, 0o644)
+		return openErr
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.sendStatus(id, sshFxNoSuchFile, "no such file")
@@ -399,7 +408,7 @@ func (s *session) handleOpen(payload []byte) {
 		return
 	}
 
-	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f})
+	handle, ok := s.addHandle(&handleEntry{path: fullPath, file: f, appendMode: flag&os.O_APPEND != 0, writable: flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0})
 	if !ok {
 		f.Close()
 		s.sendStatus(id, sshFxFailure, "too many open handles")
@@ -503,14 +512,25 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
-	// Enforce the configured per-file upload cap: reject any write whose end offset
-	// would push the file past the limit (the same bound S3/WebDAV/HTTP apply).
-	if max := s.g.config.MaxUploadBytes; max > 0 && int64(offset)+int64(len(data)) > max {
-		s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
-		return
-	}
-
-	_, err = entry.file.WriteAt([]byte(data), int64(offset))
+	err = fileops.Do(s.g.rootDir, func() error {
+		// APPEND ignores the client offset. Keep O_APPEND for atomic OS appends.
+		if entry.appendMode {
+			info, statErr := entry.file.Stat()
+			if statErr != nil {
+				return statErr
+			}
+			offset = uint64(info.Size())
+		}
+		if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
+			return fmt.Errorf("upload exceeds maximum size")
+		}
+		if entry.appendMode {
+			_, err = entry.file.Write([]byte(data))
+		} else {
+			_, err = entry.file.WriteAt([]byte(data), int64(offset))
+		}
+		return err
+	})
 	if err != nil {
 		s.sendStatus(id, sshFxFailure, "write error")
 		return
@@ -548,7 +568,15 @@ func (s *session) handleClose(payload []byte) {
 	if entry.file != nil {
 		// Report a Close error (e.g. a deferred write/flush failure) instead of
 		// claiming success — otherwise a truncated upload looks like it succeeded.
-		if err := entry.file.Close(); err != nil {
+		closeFile := entry.file.Close
+		if entry.writable {
+			closeFile = func() error {
+				return errors.Join(fileops.Do(s.g.rootDir, func() error {
+					return errors.Join(entry.file.Sync(), fileops.SyncSurvivingParent(entry.path, s.g.rootDir))
+				}), entry.file.Close())
+			}
+		}
+		if err := closeFile(); err != nil {
 			s.sendStatus(id, sshFxFailure, err.Error())
 			return
 		}
@@ -583,7 +611,7 @@ func (s *session) handleRemove(payload []byte) {
 		return
 	}
 
-	if err := os.Remove(fullPath); err != nil {
+	if err := fileops.Remove(s.g.rootDir, fullPath, false); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -609,7 +637,7 @@ func (s *session) handleMkdir(payload []byte) {
 		return
 	}
 
-	if err := os.Mkdir(fullPath, 0o755); err != nil {
+	if err := fileops.Mkdir(s.g.rootDir, fullPath, 0o755, false); err != nil {
 		if os.IsExist(err) {
 			s.sendStatus(id, sshFxFailure, "already exists")
 		} else {
@@ -646,7 +674,7 @@ func (s *session) handleRmdir(payload []byte) {
 		return
 	}
 
-	if err := os.Remove(fullPath); err != nil {
+	if err := fileops.Remove(s.g.rootDir, fullPath, false); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -682,7 +710,7 @@ func (s *session) handleRename(payload []byte) {
 		return
 	}
 
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := fileops.Rename(s.g.rootDir, oldFull, newFull); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -717,7 +745,7 @@ func (s *session) handleSetstat(payload []byte) {
 		s.sendStatus(id, sshFxPermissionDenied, "access denied")
 		return
 	}
-	if err := applyAttrs(attrs, full, nil); err != nil {
+	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, full, nil) }); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -749,7 +777,7 @@ func (s *session) handleFsetstat(payload []byte) {
 		s.sendStatus(id, sshFxFailure, "invalid handle")
 		return
 	}
-	if err := applyAttrs(attrs, entry.path, entry.file); err != nil {
+	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, entry.path, entry.file) }); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}
@@ -837,7 +865,7 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 		return
 	}
 
-	if err := os.Rename(oldFull, newFull); err != nil {
+	if err := fileops.Rename(s.g.rootDir, oldFull, newFull); err != nil {
 		s.sendStatus(id, sshFxFailure, err.Error())
 		return
 	}

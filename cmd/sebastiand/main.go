@@ -9,15 +9,18 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/solkin/sebastian/internal/config"
+	"github.com/solkin/sebastian/internal/fileops"
 	"github.com/solkin/sebastian/internal/gateway"
 	"github.com/solkin/sebastian/internal/gateway/httpui"
 	"github.com/solkin/sebastian/internal/gateway/s3"
 	"github.com/solkin/sebastian/internal/gateway/sftp"
 	"github.com/solkin/sebastian/internal/gateway/webdav"
+	"github.com/solkin/sebastian/internal/logging"
 	"github.com/solkin/sebastian/internal/multipart"
 )
 
@@ -25,18 +28,44 @@ func main() {
 	configPath := flag.String("config", "", "path to config file (optional, env vars also work)")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logs := logging.NewAsync(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	defer logs.Close()
+	logger := slog.New(logs)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
+		logs.Close()
 		os.Exit(1)
 	}
 
 	if err := os.MkdirAll(cfg.RootDir, 0o755); err != nil {
 		logger.Error("failed to create root_dir", "path", cfg.RootDir, "error", err)
+		logs.Close()
+		os.Exit(1)
+	}
+
+	private := filepath.Join(cfg.RootDir, ".sebastian")
+	if info, err := os.Lstat(private); err == nil && !info.IsDir() {
+		logger.Error("private state must be a real directory", "path", private)
+		logs.Close()
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(private, 0700); err != nil {
+		logger.Error("create private state", "error", err)
+		logs.Close()
+		os.Exit(1)
+	}
+	releaseVolume, err := fileops.AcquireLease(private)
+	if err != nil {
+		logger.Error("acquire volume lease", "error", err)
+		logs.Close()
+		os.Exit(1)
+	}
+	defer releaseVolume()
+	if err := fileops.Do(cfg.RootDir, func() error { return fileops.CheckOrphanedBackups(cfg.RootDir, nil) }); err != nil {
+		logger.Error("recover filesystem replacements", "error", err)
+		logs.Close()
 		os.Exit(1)
 	}
 
@@ -80,6 +109,7 @@ func main() {
 		}, logger)
 		if err != nil {
 			logger.Error("failed to initialize multipart store", "error", err)
+			logs.Close()
 			os.Exit(1)
 		}
 		mpStore = store
@@ -94,6 +124,7 @@ func main() {
 		}, logger)
 		if err := gw.CreateBuckets(cfg.Gateways.S3.Buckets); err != nil {
 			logger.Error("failed to create buckets", "error", err)
+			logs.Close()
 			os.Exit(1)
 		}
 		gateways = append(gateways, gw)
@@ -129,6 +160,7 @@ func main() {
 		}, logger)
 		if err != nil {
 			logger.Error("failed to create SFTP gateway", "error", err)
+			logs.Close()
 			os.Exit(1)
 		}
 		gateways = append(gateways, gw)

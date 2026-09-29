@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
 
+  workflow_call:
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -16,5 +18,8 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Vet
+        run: go vet ./...
+
       - name: Run tests
-        run: go test -race -v ./...
+        run: go test -race -count=1 -v -timeout 900s ./...

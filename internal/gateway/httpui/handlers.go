@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/solkin/sebastian/internal/fileops"
 	"github.com/solkin/sebastian/internal/gateway"
 )
 
@@ -211,7 +212,7 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(dirFullPath, 0o755); err != nil {
+	if err := fileops.Mkdir(g.rootDir, dirFullPath, 0o755, true); err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create directory")
 		return
 	}
@@ -244,7 +245,7 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		destDir := filepath.Dir(destPath)
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
+		if err := fileops.Mkdir(g.rootDir, destDir, 0o755, true); err != nil {
 			jsonError(w, http.StatusInternalServerError, "failed to create directory")
 			return
 		}
@@ -255,12 +256,13 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		dst, err := os.CreateTemp(destDir, ".seb-tmp-upload-*")
+		dst, err := fileops.CreateTemp(destDir, ".seb-tmp-upload-*")
 		if err != nil {
 			src.Close()
 			jsonError(w, http.StatusInternalServerError, "failed to create file")
 			return
 		}
+		defer fileops.ReleaseTemp(dst)
 		tmpPath := dst.Name()
 
 		_, copyErr := io.Copy(dst, src)
@@ -273,7 +275,7 @@ func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := os.Rename(tmpPath, destPath); err != nil {
+		if err := fileops.Publish(g.rootDir, tmpPath, destPath); err != nil {
 			os.Remove(tmpPath)
 			jsonError(w, http.StatusInternalServerError, "failed to save file")
 			return
@@ -305,7 +307,7 @@ func (g *Gateway) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(fullPath, 0o755); err != nil {
+	if err := fileops.Mkdir(g.rootDir, fullPath, 0o755, true); err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create directory")
 		return
 	}
@@ -346,12 +348,12 @@ func (g *Gateway) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(filepath.Dir(toFull), 0o755); err != nil {
+	if err := fileops.Mkdir(g.rootDir, filepath.Dir(toFull), 0o755, true); err != nil {
 		jsonError(w, http.StatusInternalServerError, "failed to create parent directory")
 		return
 	}
 
-	if err := os.Rename(fromFull, toFull); err != nil {
+	if err := fileops.Rename(g.rootDir, fromFull, toFull); err != nil {
 		jsonError(w, http.StatusInternalServerError, "rename failed: "+err.Error())
 		return
 	}
@@ -386,7 +388,7 @@ func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.RemoveAll(fullPath); err != nil {
+	if err := fileops.Remove(g.rootDir, fullPath, true); err != nil {
 		jsonError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
 		return
 	}

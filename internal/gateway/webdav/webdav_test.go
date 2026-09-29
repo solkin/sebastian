@@ -1047,38 +1047,6 @@ func TestDelete_DirectoryRecursive(t *testing.T) {
 	}
 }
 
-func TestStageReplace_RestoresOriginalOnFailure(t *testing.T) {
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "target.txt")
-	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	err := stageReplace(dst, func() error {
-		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
-			return err
-		}
-		return fmt.Errorf("boom")
-	})
-	if err == nil {
-		t.Fatal("expected stageReplace to return the operation error")
-	}
-	data, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "old" {
-		t.Fatalf("expected original content restored, got %q", data)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 || entries[0].Name() != "target.txt" {
-		t.Fatalf("expected only restored target, got %v", entries)
-	}
-}
-
 // --- MOVE edge cases ---
 
 func TestMove_SourceNotFound(t *testing.T) {

@@ -22,6 +22,8 @@ listed explicitly below.
 | S3 listing | V1/V2 pagination is stable; V2 KeyCount includes returned objects and CommonPrefixes. Path and virtual-host routing apply the same namespace restrictions. | S3 listing tests; `TestScratchRoutingMatchesAddressStyles` |
 | S3 batch delete | DeleteObjects takes up to 1000 keys and deletes each exactly as DeleteObject does: a missing key counts as deleted and a directory key removes nothing. A key over 1024 bytes (KeyTooLongError), one the object API refuses, or one that cannot be stat'ed (InternalError) is reported without failing the rest. `Quiet` omits deleted keys; a missing bucket is NoSuchBucket; an empty, malformed, over-1000-key, or over-8-MiB request is MalformedXML. | DeleteObjects tests |
 | S3 startup buckets | Buckets listed in `gateways.s3.buckets` (or the comma-separated `*_S3_BUCKETS` variable) are created before the gateways start when missing; existing buckets are left as they are, and a name that cannot be a bucket stops startup. | `TestCreateBuckets`; `TestCreateBuckets_RefusesWhatCannotBeABucket`; `TestLoad_S3Buckets` |
+| Filesystem publication | Atomic uploads flush their data and changed parent directories where supported (Windows directory flushing is best effort). COPY builds a private complete tree before replacement; COPY/MOVE use recovery journals, validate aliases and overwrite conditions under the namespace lock, and reject special COPY sources. | WebDAV alias, FIFO and overwrite tests; replacement process-cut and recovery tests |
+| Scratch cleanup | Active upload scratch files are retained regardless of age or mtime. Recovery backups are never swept, and pending journals defer cleanup. | Gateway scratch tests; replacement recovery tests |
 | Multipart recovery | Parts survive restart. Duplicate part versions left by a crash resolve to one newest part, with deterministic tie-breaking. Completion verifies parts before publication. | `TestRestartRecoveryChoosesNewestDuplicatePart`; multipart integrity tests |
 | Multipart isolation | Staging is hidden from gateways. The store rejects unsafe destinations, and unavailable staging prevents bucket deletion. | Multipart path tests; `TestParity_DeleteBucketUnavailableStaging` |
 | Upload limits | Omitted active-upload cap is 10,000; explicit YAML/environment zero is unlimited. Environment overrides YAML. Negative YAML limits are rejected. | `TestUploadLimitContract` |
@@ -30,9 +32,9 @@ listed explicitly below.
 | Authentication | S3 uses SigV4; WebDAV/HTTP use Basic Auth; SFTP uses SSH. Empty credential pairs select open access; partial credentials do not disable authentication. | Gateway authentication tests |
 
 `max_upload_bytes: 0` is unlimited for S3/WebDAV/SFTP. The HTTP browser keeps its
-1 GiB default request cap. SFTP writes directly to open files; atomic HTTP PUT
-and multipart publication do not imply atomic SFTP uploads. Recursive WebDAV
-COPY skips symlinks found inside the source tree.
+1 GiB default request cap. Recursive WebDAV COPY skips symlinks found inside the
+source tree. SFTP append ignores the client offset and enforces the upload limit
+against the resulting file size in both projects; publication differs below.
 
 ## Intentional differences
 
@@ -40,10 +42,12 @@ COPY skips symlinks found inside the source tree.
 | --- | --- | --- |
 | Storage setting | `sync_dir`, default `./sync` | `root_dir`, default `/data/files` |
 | Replication | Peers, watcher, SQLite metadata, repair/reconciliation | None |
+| SFTP writes | Stage a file generation until CLOSE; disconnect aborts it; one writer per inode, hard-link relationships are replaced | Write directly to the open inode; bytes are visible immediately, disconnect retains partial writes and hard links remain intact; writable CLOSE flushes data |
 | Ignore rules | Shared with node synchronization and applied to gateways | No user ignore rules |
 | Empty parent directories | Sync-aware cleanup after relevant delete/move operations, DeleteObjects included; a running node also removes a bucket left empty | Preserved until explicitly removed |
 | Reserved state | `.birak/` | `.sebastian/` |
 | Scratch names | `.birak-tmp-*`, `.birak-bak-*` | `.seb-tmp-*`, `.seb-bak-*` |
+| Recovery state | `.birak/transactions/`; recover before indexing and serving | `.sebastian/transactions/`; recover before serving, without metadata indexing |
 | SSH host-key default | Generated in `meta_dir` unless overridden | Explicit `host_key_path` required; generated there when absent |
 | Enabled gateways | May all be disabled for a replication-only node | At least one must be enabled |
 | Missing explicit config file | Continues with defaults/environment | Startup error |
@@ -54,6 +58,11 @@ checks that staging is neither indexed nor replicated and only the completed
 object arrives at a peer, and `TestDeleteObjectsReplicatesEveryDeletion` that
 every deletion of a batch reaches a peer. These node-specific tests belong only
 to Birak.
+
+Both daemons hold a process lease on their data volume. Unmapped recovery backups
+or conflicting offline edits stop startup and preserve the files for explicit
+recovery. Bounded asynchronous logging keeps a stalled output consumer from
+blocking requests. Release images are published only after tests and vet pass.
 
 ## Maintaining parity
 

@@ -250,7 +250,7 @@ func TestSweepTempFiles_AgeThreshold(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	fresh := filepath.Join(root, ".seb-tmp-active")
-	stale := filepath.Join(root, ".seb-bak-orphan")
+	stale := filepath.Join(root, ".seb-tmp-orphan")
 	keep := filepath.Join(root, "regular.txt")
 	for _, p := range []string{fresh, stale, keep} {
 		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {

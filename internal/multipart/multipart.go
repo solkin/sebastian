@@ -35,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/solkin/sebastian/internal/fileops"
 	"github.com/solkin/sebastian/internal/gateway"
 )
 
@@ -385,10 +386,11 @@ func writeMeta(dir string, up Upload) error {
 	if err != nil {
 		return fmt.Errorf("multipart: encode upload metadata: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, tempPrefix+"meta-*")
+	tmp, err := fileops.CreateTemp(dir, tempPrefix+"meta-*")
 	if err != nil {
 		return fmt.Errorf("multipart: create metadata temp: %w", err)
 	}
+	defer fileops.ReleaseTemp(tmp)
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
@@ -529,13 +531,14 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 		return Part{}, err
 	}
 
-	tmp, err := os.CreateTemp(dir, tempPrefix+"part-*")
+	tmp, err := fileops.CreateTemp(dir, tempPrefix+"part-*")
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Part{}, ErrNoSuchUpload
 		}
 		return Part{}, fmt.Errorf("multipart: create part temp: %w", err)
 	}
+	defer fileops.ReleaseTemp(tmp)
 	tmpPath := tmp.Name()
 
 	hasher := md5.New()
@@ -920,14 +923,15 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 	dir := s.uploadDir(id)
 
 	destDir := filepath.Dir(dest)
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	if err := fileops.Mkdir(s.rootDir, destDir, 0o755, true); err != nil {
 		return "", 0, fmt.Errorf("multipart: create destination dir: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(destDir, tempPrefix+"assemble-*")
+	tmp, err := fileops.CreateTemp(destDir, tempPrefix+"assemble-*")
 	if err != nil {
 		return "", 0, fmt.Errorf("multipart: create assembly temp: %w", err)
 	}
+	defer fileops.ReleaseTemp(tmp)
 	tmpPath := tmp.Name()
 	cleanup := func() {
 		tmp.Close()
@@ -986,7 +990,7 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 		return "", 0, fmt.Errorf("multipart: close assembled object: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, dest); err != nil {
+	if err := fileops.Publish(s.rootDir, tmpPath, dest); err != nil {
 		os.Remove(tmpPath)
 		return "", 0, fmt.Errorf("multipart: publish object: %w", err)
 	}
