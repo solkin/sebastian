@@ -23,3 +23,13 @@ jobs:
 
       - name: Run tests
         run: go test -race -count=1 -v -timeout 900s ./...
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build all packages on Windows
+        run: go build ./...
