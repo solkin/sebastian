@@ -19,7 +19,8 @@ listed explicitly below.
 | Scratch files and directories | Temporary and backup names at any depth are rejected in client paths and omitted from listings, including S3 prefixes and buckets. | Namespace tests in all four gateways; `TestListHidesScratchDirectories` |
 | S3 symlinks | Object paths must remain inside their bucket. Safe file aliases have matching LIST/HEAD metadata; unsafe aliases are omitted. | S3 parity tests |
 | S3 checksums | PUT, UploadPart, and DeleteObjects validate declared Content-MD5 and concrete SHA-256 digests; a rejected PUT preserves the existing object, and a rejected DeleteObjects deletes nothing. | S3 checksum tests; multipart checksum tests; `TestDeleteObjects_Digests` |
-| S3 listing | V1/V2 pagination is stable; V2 KeyCount includes returned objects and CommonPrefixes. Path and virtual-host routing apply the same namespace restrictions. | S3 listing tests; `TestScratchRoutingMatchesAddressStyles` |
+| S3 listing | Filesystem pages retain at most max-keys plus one candidate and read directories in batches, without a bucket-size cap. V1/V2 pagination is stable; V2 KeyCount includes returned objects and CommonPrefixes. Path and virtual-host routing apply the same namespace restrictions. | S3 listing tests; `TestScratchRoutingMatchesAddressStyles` |
+| S3 streaming uploads | PutObject and UploadPart decode STREAMING-AWS4-HMAC-SHA256-PAYLOAD, its -TRAILER variant, and STREAMING-UNSIGNED-PAYLOAD-TRAILER. Chunk/trailer signatures, declared decoded length, and flexible checksums are checked before publication. Failed bodies preserve the object or part; other operations and unsupported variants return 501. | Streaming upload tests and published signature/checksum vectors |
 | S3 batch delete | DeleteObjects takes up to 1000 keys and deletes each exactly as DeleteObject does: a missing key counts as deleted and a directory key removes nothing. A key over 1024 bytes (KeyTooLongError), one the object API refuses, or one that cannot be stat'ed (InternalError) is reported without failing the rest. `Quiet` omits deleted keys; a missing bucket is NoSuchBucket; an empty, malformed, over-1000-key, or over-8-MiB request is MalformedXML. | DeleteObjects tests |
 | S3 bucket deletion | A physically nonempty bucket returns BucketNotEmpty, including when all its files are ignored; ignored user data is preserved. | `TestDeleteBucketPreservesIgnoredUserData` |
 | S3 startup buckets | Buckets listed in `gateways.s3.buckets` (or the comma-separated `*_S3_BUCKETS` variable) are created before the gateways start when missing; existing buckets are left as they are, and a name that cannot be a bucket stops startup. | `TestCreateBuckets`; `TestCreateBuckets_RefusesWhatCannotBeABucket`; `TestLoad_S3Buckets` |
@@ -41,6 +42,9 @@ against the resulting file size in both projects; publication differs below.
 
 | Area | Birak | Sebastian |
 | --- | --- | --- |
+| S3 listing source | Indexed daemon LIST; external files enter LIST after indexing. Gateway fallback uses bounded filesystem pages | Filesystem pages see current disk entries; deep pages still scan the matching namespace |
+| Portable names | Reserves case-folded and Unicode-normalized spellings, including deletion history; case-only rename is rejected | Names follow the local filesystem |
+| Native S3 TLS | Optional certificate/key settings | TLS terminates at the reverse proxy |
 | Storage setting | `sync_dir`, default `./sync` | `root_dir`, default `/data/files` |
 | Replication | Peers, watcher, SQLite metadata, repair/reconciliation | None |
 | SFTP writes | Stage a file generation until CLOSE; disconnect aborts it; one writer per inode, hard-link relationships are replaced | Write directly to the open inode; bytes are visible immediately, disconnect retains partial writes and hard links remain intact; writable CLOSE flushes data |
@@ -51,7 +55,6 @@ against the resulting file size in both projects; publication differs below.
 | Recovery state | `.birak/transactions/`; recover before indexing and serving | `.sebastian/transactions/`; recover before serving, without metadata indexing |
 | SSH host-key default | Generated in `meta_dir` unless overridden | Explicit `host_key_path` required; generated there when absent |
 | Enabled gateways | May all be disabled for a replication-only node | At least one must be enabled |
-| Missing explicit config file | Continues with defaults/environment | Startup error |
 | Identity and presentation | Birak module, environment prefix, S3 owner and UI branding | Sebastian equivalents |
 
 Birak's `TestMultipartReplicationPublishesOnlyCompletedObject` additionally
@@ -60,10 +63,15 @@ object arrives at a peer, and `TestDeleteObjectsReplicatesEveryDeletion` that
 every deletion of a batch reaches a peer. These node-specific tests belong only
 to Birak.
 
+An explicitly supplied configuration file must exist in both daemons. Birak
+also rejects malformed numeric, duration, and boolean environment overrides.
+
 Both daemons hold a process lease on their data volume. Unmapped recovery backups
 or conflicting offline edits stop startup and preserve the files for explicit
 recovery. Bounded asynchronous logging keeps a stalled output consumer from
-blocking requests. Release images are published only after tests and vet pass.
+blocking requests. Both CI pipelines check source and release-binary vulnerabilities,
+tests and vet before publishing release images. Birak also requires Docker
+replication and TLS workload acceptance.
 
 ## Maintaining parity
 

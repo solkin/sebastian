@@ -139,6 +139,13 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only object PUTs decode streaming bodies. Refuse them elsewhere before
+	// a handler can act on undecoded bytes.
+	if streamingBody(r) && r.Method != http.MethodPut {
+		writeStreamingNotImplemented(w)
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
 	if vhBucket := g.extractBucketFromHost(r.Host); vhBucket != "" {
@@ -171,6 +178,10 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	if key == "" {
+		if streamingBody(r) {
+			writeStreamingNotImplemented(w)
+			return
+		}
 		query := r.URL.Query()
 		if _, ok := query["uploads"]; ok && r.Method == http.MethodGet {
 			g.handleListMultipartUploads(w, r, bucket)

@@ -21,8 +21,8 @@ import (
 // the client-supplied x-amz-content-sha256 value (or UNSIGNED-PAYLOAD) verbatim,
 // as the signing spec requires. This authenticates the requester without buffering
 // the body; payload integrity (when the client declares a concrete digest) is
-// enforced separately in handlePutObject. aws-chunked / streaming-signed bodies
-// are not decoded.
+// enforced separately in handlePutObject. A streaming-signed (aws-chunked) body
+// is verified chunk by chunk from this seed signature in streaming.go.
 
 const (
 	sigV4Algorithm   = "AWS4-HMAC-SHA256"

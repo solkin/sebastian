@@ -17,6 +17,9 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 
 ## Quick Start
 
+Current release: **v1.6.1**. Read the [release and upgrade notes](docs/releases/v1.6.1.md)
+before upgrading an existing server.
+
 ### Docker
 
 ```bash
@@ -254,9 +257,26 @@ Any S3 SDK or tool configured with the same credentials works out of the box.
 - Presigned URLs are validated against their `X-Amz-Expires` window.
 - When a client sends a concrete `x-amz-content-sha256` digest, uploads are
   re-hashed and rejected on mismatch, so a captured signed request cannot be
-  replayed with a swapped body. `UNSIGNED-PAYLOAD` and `aws-chunked` streaming
-  bodies carry no verifiable digest and are not integrity-checked; run behind TLS
-  for transport security.
+  replayed with a swapped body. Signed streaming bodies additionally verify
+  the signature chain of their chunks and signed trailers. Run behind TLS for
+  transport security, including when using `UNSIGNED-PAYLOAD`.
+
+### Streaming uploads
+
+PutObject and UploadPart decode `aws-chunked` before storing the bytes. Supported
+modes are `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, its `-TRAILER` variant, and
+`STREAMING-UNSIGNED-PAYLOAD-TRAILER`. Declared decoded length and flexible
+checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256) are checked before publication.
+A failed checksum, signature, or framing check preserves the existing object or
+part. Other streaming variants and streaming bodies on other operations return
+`501 NotImplemented` before changing data.
+
+Older versions could acknowledge these uploads while storing their framing.
+Compare affected existing objects with their original checksums and upload the
+originals again when they differ; upgrading does not repair those bytes.
+
+S3 LIST keeps a bounded page of candidates while walking the full matching tree;
+objects beyond the first 100000 remain available through V1/V2 pagination.
 
 Leaving both keys empty disables authentication (all requests are allowed).
 

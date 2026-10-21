@@ -263,17 +263,25 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
+	// As for PutObject, an aws-chunked body is decoded and its signatures,
+	// decoded length, and flexible checksum are checked as the part streams; a
+	// failed check aborts the part before it is staged.
+	body, failure := g.newPayload(r)
+	if failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
+		return
+	}
 	// The whole-object cap still applies per part: a part larger than the object
 	// limit could never be completed anyway.
-	body := r.Body
+	var src io.Reader = body
 	if g.config.MaxUploadBytes > 0 {
-		body = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
+		src = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
 	}
 
 	// Mirror PutObject: when the client declares a concrete payload SHA-256 — the
 	// value its SigV4 signature covers — the part is re-hashed and a mismatch is
 	// refused, so a captured signed request cannot be replayed with a swapped body.
-	part, err := g.multipart.WritePart(uploadID, partNumber, body, multipart.Checksums{
+	part, err := g.multipart.WritePart(uploadID, partNumber, src, multipart.Checksums{
 		ContentMD5:    r.Header.Get("Content-MD5"),
 		ContentSHA256: r.Header.Get("X-Amz-Content-Sha256"),
 	})
@@ -284,6 +292,12 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 				"Your proposed upload exceeds the maximum allowed size")
 			return
 		}
+		if errors.As(err, &failure) {
+			g.logger.Warn("upload part: payload rejected", "bucket", bucket, "key", key,
+				"upload_id", uploadID, "part", partNumber, "code", failure.code)
+			writeS3Error(w, failure.status, failure.code, failure.message)
+			return
+		}
 		g.writeMultipartError(w, err, "upload-part", bucket, key)
 		return
 	}
@@ -292,6 +306,7 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		"part", partNumber, "size", part.Size)
 
 	w.Header().Set("ETag", `"`+part.ETag+`"`)
+	body.setChecksumHeader(w)
 	w.WriteHeader(http.StatusOK)
 }
 

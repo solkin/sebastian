@@ -27,7 +27,7 @@ func TestReplacementRecoveryChild(t *testing.T) {
 	}
 	err := replaceLocked(root, src, dst, build, func(step string) {
 		if step == "published" {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			killReplacementProcess(t)
 		}
 	})
 	t.Fatalf("child missed checkpoint: %v", err)

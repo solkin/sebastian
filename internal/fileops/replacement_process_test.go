@@ -11,13 +11,14 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestReplacementProcessCuts(t *testing.T) {
 	if root := os.Getenv("SEBASTIAN_REPLACE_ROOT"); root != "" {
 		checkpoint := func(step string) {
 			if step == os.Getenv("SEBASTIAN_REPLACE_CUT") {
-				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				killReplacementProcess(t)
 			}
 		}
 		if os.Getenv("SEBASTIAN_REPLACE_RECOVER") == "true" {
@@ -106,5 +107,17 @@ func TestReplacementProcessCuts(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A self-directed SIGKILL can be delivered after Kill returns. Keep the child at
+// the chosen boundary so no cleanup runs while the signal is pending.
+func killReplacementProcess(t *testing.T) {
+	t.Helper()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		time.Sleep(time.Hour)
 	}
 }

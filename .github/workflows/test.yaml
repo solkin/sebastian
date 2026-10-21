@@ -21,6 +21,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Check source and release binary vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/sebastian-security-check" ./cmd/sebastiand
+          govulncheck -mode=binary "$RUNNER_TEMP/sebastian-security-check"
+
       - name: Run tests
         run: go test -race -count=1 -v -timeout 900s ./...
 
