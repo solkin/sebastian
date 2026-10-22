@@ -104,15 +104,6 @@ func md5HexOf(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func compositeETagOf(payloads [][]byte) string {
-	h := md5.New()
-	for _, p := range payloads {
-		sum := md5.Sum(p)
-		h.Write(sum[:])
-	}
-	return fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(h.Sum(nil)), len(payloads))
-}
-
 // errorCode extracts the S3 error code from a response body.
 func errorCode(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
@@ -148,17 +139,18 @@ func TestMultipart_FullCycle(t *testing.T) {
 	if err := xml.Unmarshal(w.Body.Bytes(), &res); err != nil {
 		t.Fatalf("parse complete response: %v", err)
 	}
-	if res.ETag != compositeETagOf(payloads) {
-		t.Fatalf("etag = %s, want %s", res.ETag, compositeETagOf(payloads))
-	}
 	if res.Bucket != "bucket" || res.Key != "docs/report.bin" {
 		t.Fatalf("complete response = %+v", res)
 	}
 
-	// The object is readable through the normal object API.
+	// The object is readable through the normal object API, under the ETag the
+	// completion reported: one object has one ETag on every response.
 	got := serveRequest(g, http.MethodGet, "/bucket/docs/report.bin", nil, noAuth())
 	if got.Code != http.StatusOK {
 		t.Fatalf("get object: status %d", got.Code)
+	}
+	if res.ETag != got.Header().Get("ETag") {
+		t.Fatalf("complete etag = %s, GET etag = %s", res.ETag, got.Header().Get("ETag"))
 	}
 	if !bytes.Equal(got.Body.Bytes(), bytes.Join(payloads, nil)) {
 		t.Fatal("assembled object has wrong content")
@@ -289,26 +281,74 @@ func TestMultipart_RetriedPartReplacesPrevious(t *testing.T) {
 	}
 }
 
-func TestMultipart_RepeatedCompleteIsRejected(t *testing.T) {
-	g, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+// TestMultipart_RepeatedCompleteIsIdempotent retries a completion the way a
+// client does after a timeout: the same part list for an object that is still
+// the one the completion produced gets the same answer; any other completion of
+// the finished upload is NoSuchUpload, as for an upload that never existed.
+func TestMultipart_RepeatedCompleteIsIdempotent(t *testing.T) {
+	g, root, store := multipartGateway(t, Config{}, multipart.Limits{})
 
 	uploadID := initiateUpload(t, g, "bucket", "obj")
 	payload := bytes.Repeat([]byte("a"), 8)
 	etag := uploadPart(t, g, "bucket", "obj", uploadID, 1, payload)
 	parts := []CompletePartEntry{{PartNumber: 1, ETag: etag}}
 
-	if w := completeUpload(g, "bucket", "obj", uploadID, parts); w.Code != http.StatusOK {
-		t.Fatalf("first complete: status %d: %s", w.Code, w.Body.String())
+	first := completeUpload(g, "bucket", "obj", uploadID, parts)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first complete: status %d: %s", first.Code, first.Body.String())
+	}
+	retry := completeUpload(g, "bucket", "obj", uploadID, parts)
+	if retry.Code != http.StatusOK || retry.Body.String() != first.Body.String() {
+		t.Fatalf("retried complete: status %d: %s\nfirst: %s", retry.Code, retry.Body.String(), first.Body.String())
+	}
+	// The record survives a restart: a new gateway over the same store answers.
+	g2 := New(root, Config{Multipart: store}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if again := completeUpload(g2, "bucket", "obj", uploadID, parts); again.Code != http.StatusOK || again.Body.String() != first.Body.String() {
+		t.Fatalf("complete after restart: status %d: %s", again.Code, again.Body.String())
+	}
+
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"other part list": completeUpload(g, "bucket", "obj", uploadID,
+			[]CompletePartEntry{{PartNumber: 1, ETag: `"` + md5HexOf([]byte("other")) + `"`}}),
+		"other object": completeUpload(g, "bucket", "other", uploadID, parts),
+	} {
+		if w.Code != http.StatusNotFound || errorCode(t, w) != "NoSuchUpload" {
+			t.Fatalf("%s: status %d, body %s", name, w.Code, w.Body.String())
+		}
+	}
+
+	// Once the object is replaced, the completion is history.
+	if w := serveRequest(g, http.MethodPut, "/bucket/obj", strings.NewReader("replaced"), noAuth()); w.Code != http.StatusOK {
+		t.Fatalf("overwrite: %d", w.Code)
 	}
 	w := completeUpload(g, "bucket", "obj", uploadID, parts)
 	if w.Code != http.StatusNotFound || errorCode(t, w) != "NoSuchUpload" {
-		t.Fatalf("second complete: status %d, body %s", w.Code, w.Body.String())
+		t.Fatalf("complete after overwrite: status %d, body %s", w.Code, w.Body.String())
 	}
-
-	// The object written by the first completion is untouched.
 	got := serveRequest(g, http.MethodGet, "/bucket/obj", nil, noAuth())
-	if !bytes.Equal(got.Body.Bytes(), payload) {
-		t.Fatal("object was modified by the rejected retry")
+	if got.Body.String() != "replaced" {
+		t.Fatalf("object was modified by a rejected retry: %q", got.Body.String())
+	}
+}
+
+// TestMultipart_RetryWaitsForCompletionInFlight retries a completion while the
+// first is still assembling, as a client that timed out on a large object
+// does: the retry waits for it and gets its result.
+func TestMultipart_RetryWaitsForCompletionInFlight(t *testing.T) {
+	g, _, _ := multipartGateway(t, Config{}, multipart.Limits{})
+	uploadID := initiateUpload(t, g, "bucket", "big.apk")
+	var parts []CompletePartEntry
+	for i := 1; i <= 3; i++ {
+		etag := uploadPart(t, g, "bucket", "big.apk", uploadID, i, bytes.Repeat([]byte{byte('a' + i)}, 64<<10))
+		parts = append(parts, CompletePartEntry{PartNumber: i, ETag: etag})
+	}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		go func() { results <- completeUpload(g, "bucket", "big.apk", uploadID, parts) }()
+	}
+	a, b := <-results, <-results
+	if a.Code != http.StatusOK || b.Code != http.StatusOK || a.Body.String() != b.Body.String() {
+		t.Fatalf("concurrent completions: %d %s / %d %s", a.Code, a.Body.String(), b.Code, b.Body.String())
 	}
 }
 

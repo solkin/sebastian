@@ -259,6 +259,19 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
+	// Refuse a part that declares more than any part may be before reading it
+	// (see declaredTooLarge). The whole-object cap applies per part too: a part
+	// larger than the object limit could never be completed anyway.
+	partLimit := g.multipart.Limits().MaxPartBytes
+	if g.config.MaxUploadBytes > 0 && g.config.MaxUploadBytes < partLimit {
+		partLimit = g.config.MaxUploadBytes
+	}
+	if declaredTooLarge(r, partLimit) {
+		writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge",
+			"Your proposed upload exceeds the maximum allowed size")
+		return
+	}
+
 	if _, ok := g.ownedUpload(w, uploadID, bucket, key); !ok {
 		return
 	}
@@ -271,17 +284,16 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		writeS3Error(w, failure.status, failure.code, failure.message)
 		return
 	}
-	// The whole-object cap still applies per part: a part larger than the object
-	// limit could never be completed anyway.
 	var src io.Reader = body
 	if g.config.MaxUploadBytes > 0 {
 		src = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
 	}
+	tracked := &trackedBody{r: src}
 
 	// Mirror PutObject: when the client declares a concrete payload SHA-256 — the
 	// value its SigV4 signature covers — the part is re-hashed and a mismatch is
 	// refused, so a captured signed request cannot be replayed with a swapped body.
-	part, err := g.multipart.WritePart(uploadID, partNumber, src, multipart.Checksums{
+	part, err := g.multipart.WritePart(uploadID, partNumber, tracked, multipart.Checksums{
 		ContentMD5:    r.Header.Get("Content-MD5"),
 		ContentSHA256: r.Header.Get("X-Amz-Content-Sha256"),
 	})
@@ -296,6 +308,12 @@ func (g *Gateway) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 			g.logger.Warn("upload part: payload rejected", "bucket", bucket, "key", key,
 				"upload_id", uploadID, "part", partNumber, "code", failure.code)
 			writeS3Error(w, failure.status, failure.code, failure.message)
+			return
+		}
+		if clientAborted(r, tracked) {
+			g.logger.Info("upload part: client aborted the upload", "bucket", bucket, "key", key,
+				"upload_id", uploadID, "part", partNumber, "error", err)
+			writeObjectFailure(w, errIncompleteBody)
 			return
 		}
 		g.writeMultipartError(w, err, "upload-part", bucket, key)
@@ -316,7 +334,21 @@ func (g *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	if _, ok := g.ownedUpload(w, uploadID, bucket, key); !ok {
+	// A live upload must belong to the URL's object. One that is gone may have
+	// been completed already; the store answers a retry of that completion
+	// from its record, which is bound to the same object.
+	if up, err := g.multipart.Get(uploadID); err == nil {
+		if up.Bucket != bucket || up.Key != key {
+			g.writeMultipartError(w, multipart.ErrNoSuchUpload, "complete", bucket, key)
+			return
+		}
+	} else if !errors.Is(err, multipart.ErrNoSuchUpload) {
+		g.writeMultipartError(w, err, "complete", bucket, key)
+		return
+	}
+	conditions, failure := parseWriteConditions(r)
+	if failure != nil {
+		writeObjectFailure(w, failure)
 		return
 	}
 
@@ -328,6 +360,12 @@ func (g *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	if len(data) > maxCompleteBodyBytes {
 		writeS3Error(w, http.StatusRequestEntityTooLarge, "MaxMessageLengthExceeded",
 			"Your request was too large.")
+		return
+	}
+	// The part list decides which bytes become the object, so it is held to its
+	// declared digests as DeleteObjects' key list is.
+	if failure := checkBodyDigests(r, data); failure != nil {
+		writeObjectFailure(w, failure)
 		return
 	}
 
@@ -343,21 +381,29 @@ func (g *Gateway) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		parts = append(parts, multipart.CompletePart{Number: p.PartNumber, ETag: p.ETag})
 	}
 
-	result, err := g.multipart.Complete(uploadID, parts, objPath)
+	result, err := g.multipart.CompleteIf(uploadID, parts, objPath, conditions.precondition())
 	if err != nil {
+		if failure := publishFailure(err, objPath); failure != nil {
+			writeObjectFailure(w, failure)
+			return
+		}
 		g.writeMultipartError(w, err, "complete", bucket, key)
 		return
 	}
 
-	g.logger.Info("object created via multipart upload",
-		"bucket", bucket, "key", key, "upload_id", uploadID, "parts", result.Parts, "size", result.Size)
+	if !result.Repeated {
+		g.logger.Info("object created via multipart upload",
+			"bucket", bucket, "key", key, "upload_id", uploadID, "parts", result.Parts, "size", result.Size)
+	}
 
+	// The ETag is the one HEAD, GET and LIST report for the object, not S3's
+	// composite md5-N: one object has one ETag on every response.
 	writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
 		Xmlns:    s3Xmlns,
 		Location: g.objectLocation(r, bucket, key),
 		Bucket:   bucket,
 		Key:      key,
-		ETag:     `"` + result.ETag + `"`,
+		ETag:     etagFor(result.Info),
 	})
 }
 

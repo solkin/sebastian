@@ -8,8 +8,11 @@ RUN CGO_ENABLED=0 go build -o sebastiand ./cmd/sebastiand
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+# Upgrade the base packages at build time, so a release carries the security
+# fixes published since the base image tag was cut.
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
 COPY --from=builder /build/sebastiand /usr/local/bin/sebastiand
+COPY scripts/find-aws-chunked.sh /usr/local/bin/find-aws-chunked
 
 # Run as a non-root user that owns the data directory.
 RUN addgroup -S sebastian && adduser -S -G sebastian sebastian \

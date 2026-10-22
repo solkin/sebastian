@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,9 +72,18 @@ func TestCanonicalHeaders_ContentLength(t *testing.T) {
 // and reuses the production signer, so a passing TestSigV4_KnownAnswer anchors
 // correctness.
 func signV4Header(req *http.Request, accessKey, secretKey string) {
+	signV4HeaderScoped(req, accessKey, secretKey, "")
+}
+
+// signV4HeaderScoped is signV4Header with the credential scope dated scopeDate
+// (yyyymmdd) instead of today, for the tests that must be refused for it.
+func signV4HeaderScoped(req *http.Request, accessKey, secretKey, scopeDate string) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
+	if scopeDate != "" {
+		date = scopeDate
+	}
 	scope := date + "/us-east-1/s3/aws4_request"
 
 	req.Header.Set("X-Amz-Date", amzDate)
@@ -96,9 +107,18 @@ func signV4Header(req *http.Request, accessKey, secretKey string) {
 // query signature over the host header, valid for expires seconds. It signs with
 // the current time so the request falls within its enforced validity window.
 func presignV4(method, rawPath, host, accessKey, secretKey string, expires int) string {
+	return presignV4Scoped(method, rawPath, host, accessKey, secretKey, expires, "")
+}
+
+// presignV4Scoped is presignV4 with the credential scope dated scopeDate
+// (yyyymmdd) instead of today.
+func presignV4Scoped(method, rawPath, host, accessKey, secretKey string, expires int, scopeDate string) string {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
+	if scopeDate != "" {
+		date = scopeDate
+	}
 	scope := date + "/us-east-1/s3/aws4_request"
 
 	u, _ := url.Parse(rawPath)
@@ -118,4 +138,55 @@ func presignV4(method, rawPath, host, accessKey, secretKey string, expires int) 
 	q.Set("X-Amz-Signature", sig)
 
 	return u.Path + "?" + q.Encode()
+}
+
+// TestAuth_PresignedExpiresBounds refuses a presigned URL that claims a
+// validity outside 1 second to 7 days, as S3 does: a URL signed with a huge
+// X-Amz-Expires would otherwise be a credential that never expires.
+func TestAuth_PresignedExpiresBounds(t *testing.T) {
+	g, root := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+	if err := os.Mkdir(filepath.Join(root, "bucket"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for expires, want := range map[int]int{
+		1:       http.StatusNotFound, // authenticated; the object is missing
+		604800:  http.StatusNotFound,
+		604801:  http.StatusForbidden,
+		0:       http.StatusForbidden,
+		-1:      http.StatusForbidden,
+		1 << 30: http.StatusForbidden,
+	} {
+		path := presignV4(http.MethodGet, "/bucket/file.txt", "example.com", "admin", "secret", expires)
+		if w := serveRequest(g, http.MethodGet, path, nil, map[string]string{"Host": "example.com"}); w.Code != want {
+			t.Fatalf("X-Amz-Expires=%d: status %d, want %d", expires, w.Code, want)
+		}
+	}
+}
+
+// TestAuth_ScopeDateMustMatchRequestDate refuses a signature whose credential
+// scope is dated another day than X-Amz-Date, in both signature forms. The key
+// is derived from the scope date, so a key leaked for one day would otherwise
+// sign fresh requests on any day.
+func TestAuth_ScopeDateMustMatchRequestDate(t *testing.T) {
+	g, root := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
+	if err := os.Mkdir(filepath.Join(root, "bucket"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("20060102")
+
+	for scope, want := range map[string]int{"": http.StatusOK, yesterday: http.StatusForbidden} {
+		req := httptest.NewRequest(http.MethodGet, "/bucket", nil)
+		req.Host = "example.com"
+		signV4HeaderScoped(req, "admin", "secret", scope)
+		w := httptest.NewRecorder()
+		g.route(w, req)
+		if w.Code != want {
+			t.Fatalf("header form, scope %q: status %d, want %d", scope, w.Code, want)
+		}
+
+		path := presignV4Scoped(http.MethodGet, "/bucket", "example.com", "admin", "secret", 900, scope)
+		if w := serveRequest(g, http.MethodGet, path, nil, map[string]string{"Host": "example.com"}); w.Code != want {
+			t.Fatalf("presigned, scope %q: status %d, want %d", scope, w.Code, want)
+		}
+	}
 }

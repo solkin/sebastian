@@ -29,6 +29,10 @@ const (
 	unsignedPayload  = "UNSIGNED-PAYLOAD"
 	amzDateFormat    = "20060102T150405Z"
 	presignSkewGrace = 15 * time.Minute
+	// maxPresignExpires is the longest validity a presigned URL may claim, in
+	// seconds: seven days, as in S3. Without it, a URL signed once would grant
+	// access for as long as it asked to.
+	maxPresignExpires = 7 * 24 * 60 * 60
 )
 
 // nowUTC returns the current time in UTC. It is a variable so tests can pin the
@@ -81,7 +85,7 @@ func verifyHeaderV4(r *http.Request, accessKey, secretKey string) bool {
 
 	// A header-form signature carries no explicit expiry, so without a clock-skew
 	// window a captured Authorization header would replay forever. Bound it.
-	if !withinSkew(amzDate) {
+	if !withinSkew(amzDate) || !scopeDateMatches(cred, amzDate) {
 		return false
 	}
 
@@ -122,7 +126,7 @@ func verifyPresignedV4(r *http.Request, accessKey, secretKey string) bool {
 		return false
 	}
 
-	if !presignedNotExpired(amzDate, q.Get("X-Amz-Expires")) {
+	if !presignedNotExpired(amzDate, q.Get("X-Amz-Expires")) || !scopeDateMatches(cred, amzDate) {
 		return false
 	}
 
@@ -279,7 +283,7 @@ func presignedNotExpired(amzDate, expiresStr string) bool {
 		return false
 	}
 	expires, err := strconv.Atoi(expiresStr)
-	if err != nil || expires <= 0 {
+	if err != nil || expires < 1 || expires > maxPresignExpires {
 		return false
 	}
 	now := nowUTC()
@@ -302,6 +306,15 @@ func withinSkew(amzDate string) bool {
 		delta = -delta
 	}
 	return delta <= presignSkewGrace
+}
+
+// scopeDateMatches reports whether the date of a credential scope is the day of
+// the request's X-Amz-Date, as SigV4 requires. The signing key is derived from
+// the scope date while freshness is judged by X-Amz-Date, so a mismatch would
+// let a key derived for one day sign requests on any other.
+func scopeDateMatches(cred credential, amzDate string) bool {
+	const day = len("20060102")
+	return len(amzDate) >= day && cred.date == amzDate[:day]
 }
 
 // containsHeader reports whether name appears in the (lowercased) signed-headers list.

@@ -597,8 +597,7 @@ func (g *Gateway) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 
 	pageObjects, pagePrefixes, isTruncated, nextToken, err := g.filesystemPage(r.Context(), bp, prefix, delimiter, marker, maxKeys)
 	if err != nil {
-		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		g.listFailed(w, r, bucket, err)
 		return
 	}
 
@@ -639,8 +638,7 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 
 	pageObjects, pagePrefixes, isTruncated, nextToken, err := g.filesystemPage(r.Context(), bp, prefix, delimiter, skipAfter, maxKeys)
 	if err != nil {
-		g.logger.Error("list objects walk failed", "bucket", bucket, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		g.listFailed(w, r, bucket, err)
 		return
 	}
 
@@ -661,6 +659,17 @@ func (g *Gateway) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 
 	g.logger.Debug("list objects v2", "bucket", bucket, "prefix", prefix, "count", len(pageObjects))
 	writeXML(w, http.StatusOK, result)
+}
+
+// listFailed answers a listing that could not be made. A client that went away
+// mid-listing cancelled it, which is no fault of this server.
+func (g *Gateway) listFailed(w http.ResponseWriter, r *http.Request, bucket string, err error) {
+	if clientAborted(r, nil) {
+		g.logger.Debug("list objects: client went away", "bucket", bucket, "error", err)
+	} else {
+		g.logger.Error("list objects failed", "bucket", bucket, "error", err)
+	}
+	writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 }
 
 // parseMaxKeys extracts max-keys from the query, defaulting to 1000. It returns
@@ -685,74 +694,156 @@ func parseMaxKeys(r *http.Request) (int, bool) {
 	return n, true
 }
 
-// handleHeadObject returns metadata for an object.
-func (g *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if !validateBucketName(bucket) || !validateKey(key) {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid argument")
-		return
+// bucketExists reports whether a bucket directory is there. A bucket that
+// cannot be looked at is assumed to exist, so an unreadable volume is not
+// reported as a missing bucket.
+func (g *Gateway) bucketExists(bucket string) bool {
+	bp, ok := g.bucketPath(bucket)
+	if !ok {
+		return false
 	}
+	info, err := os.Stat(bp)
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	return info.IsDir()
+}
 
+// missingObject is the answer for a key with nothing behind it: NoSuchBucket
+// when its bucket is missing too, as S3 reports it, and NoSuchKey otherwise.
+func (g *Gateway) missingObject(bucket string) *objectFailure {
+	if !g.bucketExists(bucket) {
+		return errNoSuchBucket
+	}
+	return errNoSuchKey
+}
+
+// statObject resolves the key of a read and stats the object behind it. A
+// folder, a key below an object, and a missing bucket all read as no object.
+func (g *Gateway) statObject(bucket, key string) (string, os.FileInfo, *objectFailure) {
+	if !validateBucketName(bucket) || !validateKey(key) {
+		return "", nil, &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid argument"}
+	}
 	op, ok := g.objectPath(bucket, key)
 	if !ok {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
-		return
+		return "", nil, &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid key"}
 	}
-
 	info, err := os.Stat(op)
-	if os.IsNotExist(err) || (err == nil && info.IsDir()) {
-		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
-		return
+	switch {
+	case err == nil && !info.IsDir():
+		return op, info, nil
+	case err == nil || readMissing(err):
+		return "", nil, g.missingObject(bucket)
+	case errors.Is(err, syscall.ENAMETOOLONG):
+		return "", nil, errKeyTooLong
 	}
-	if err != nil {
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+	g.logger.Error("stat object failed", "bucket", bucket, "key", key, "error", err)
+	return "", nil, &objectFailure{http.StatusInternalServerError, "InternalError", "Internal error"}
+}
+
+// setObjectHeaders sets the headers that describe an object on a GET or HEAD.
+func setObjectHeaders(w http.ResponseWriter, key string, info os.FileInfo) {
+	h := w.Header()
+	h.Set("Content-Type", contentTypeFor(key))
+	h.Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
+	h.Set("ETag", etagFor(info))
+	h.Set("Accept-Ranges", "bytes")
+}
+
+// handleHeadObject returns metadata for an object.
+func (g *Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	_, info, failure := g.statObject(bucket, key)
+	if failure != nil {
+		writeObjectFailure(w, failure)
 		return
 	}
 
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
-	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("ETag", etagFor(info))
+	setObjectHeaders(w, key, info)
+	switch evaluateConditions(r, readConditions, info) {
+	case conditionFailed:
+		writeObjectFailure(w, errPreconditionFailed)
+		return
+	case conditionNotModified:
+		writeNotModified(w, info)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.WriteHeader(http.StatusOK)
 }
 
 // handleGetObject serves an object's content.
+//
+// Preconditions and ranges are decided here, so that every answer that is not
+// the object itself is an S3 error with a body that matches its headers:
+// net/http's ServeContent would answer a failed If-Match with an empty 412 under
+// the object's Content-Length, and an unsatisfiable range with text/plain. What
+// remains for ServeContent is serving the bytes, whole or ranged.
 func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if !validateBucketName(bucket) || !validateKey(key) {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid argument")
-		return
-	}
-
-	op, ok := g.objectPath(bucket, key)
-	if !ok {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
-		return
-	}
-
-	info, err := os.Stat(op)
-	if os.IsNotExist(err) || (err == nil && info.IsDir()) {
-		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
-		return
-	}
-	if err != nil {
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+	op, _, failure := g.statObject(bucket, key)
+	if failure != nil {
+		writeObjectFailure(w, failure)
 		return
 	}
 
 	f, err := os.Open(op)
 	if err != nil {
+		if readMissing(err) {
+			// Deleted between the stat and the open.
+			writeObjectFailure(w, g.missingObject(bucket))
+			return
+		}
 		g.logger.Error("get object: open failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
-	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
-	w.Header().Set("ETag", etagFor(info))
+	setObjectHeaders(w, key, info)
+	switch evaluateConditions(r, readConditions, info) {
+	case conditionFailed:
+		writeObjectFailure(w, errPreconditionFailed)
+		return
+	case conditionNotModified:
+		writeNotModified(w, info)
+		return
+	}
+
+	// ServeContent gets a request whose conditions are already settled.
+	serve := r.Clone(r.Context())
+	for _, h := range []string{"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+		serve.Header.Del(h)
+	}
+	if !ifRangeHolds(r, info) {
+		serve.Header.Del("Range")
+	} else {
+		switch classifyRange(r.Header.Get("Range"), info.Size()) {
+		case rangeIgnore:
+			serve.Header.Del("Range")
+		case rangeUnsatisfiable:
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
+			writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
+				"The requested range is not satisfiable")
+			return
+		}
+	}
 
 	g.logger.Debug("get object", "bucket", bucket, "key", key, "size", info.Size())
-	http.ServeContent(w, r, filepath.Base(op), info.ModTime(), f)
+	http.ServeContent(w, serve, "", info.ModTime(), f)
+}
+
+// declaredTooLarge reports whether a request body declares, before it is read,
+// more than limit bytes; limit <= 0 is no limit. A plain body declares its
+// Content-Length; an aws-chunked one declares its decoded length instead, which
+// newPayload holds to the upload cap itself. Refusing here is what keeps an
+// oversized upload from being sent at all: a client that asked for
+// 100-continue is answered before it is told to go ahead.
+func declaredTooLarge(r *http.Request, limit int64) bool {
+	return limit > 0 && !streamingBody(r) && r.ContentLength > limit
 }
 
 // handlePutObject writes an object to the bucket.
@@ -780,6 +871,32 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	if declaredTooLarge(r, g.config.MaxUploadBytes) {
+		writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+		return
+	}
+	conditions, failure := parseWriteConditions(r)
+	if failure != nil {
+		writeObjectFailure(w, failure)
+		return
+	}
+	// Refuse what is bound to fail before the body is read: a key that is a
+	// folder, or a condition that already does not hold. The condition is
+	// decided for good only at publication, under the root lock.
+	current, statErr := os.Stat(op)
+	if statErr == nil && current.IsDir() {
+		writeObjectFailure(w, errObjectIsDirectory)
+		return
+	}
+	if err := conditions.check(current, statErr); err != nil {
+		if failure := writeFailure(err); failure != nil {
+			writeObjectFailure(w, failure)
+			return
+		}
+		// A stat that fails here for another reason fails the write later too,
+		// where it is reported; nothing is decided by it now.
+	}
+
 	// Decode an aws-chunked body and check its signatures, decoded length, and
 	// flexible checksum as it is read.
 	body, failure := g.newPayload(r)
@@ -792,6 +909,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	if g.config.MaxUploadBytes > 0 {
 		src = http.MaxBytesReader(w, body, g.config.MaxUploadBytes)
 	}
+	tracked := &trackedBody{r: src}
 
 	// When the client declares a concrete payload SHA-256 (the value the SigV4
 	// signature is computed over), verify the streamed body against it and reject a
@@ -819,6 +937,10 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	// Create parent directories if needed.
 	dir := filepath.Dir(op)
 	if err := fileops.Mkdir(g.rootDir, dir, 0o755, true); err != nil {
+		if failure := writeFailure(err); failure != nil {
+			writeObjectFailure(w, failure)
+			return
+		}
 		g.logger.Error("put object: mkdir failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create directories")
 		return
@@ -841,7 +963,7 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	if md5Hasher != nil {
 		writers = append(writers, md5Hasher)
 	}
-	size, err := io.Copy(io.MultiWriter(writers...), src)
+	size, err := io.Copy(io.MultiWriter(writers...), tracked)
 	tmpFile.Close()
 	if err != nil {
 		os.Remove(tmpPath)
@@ -853,6 +975,12 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		if errors.As(err, &failure) {
 			g.logger.Warn("put object: payload rejected", "bucket", bucket, "key", key, "code", failure.code)
 			writeS3Error(w, failure.status, failure.code, failure.message)
+			return
+		}
+		if clientAborted(r, tracked) {
+			g.logger.Info("put object: client aborted the upload", "bucket", bucket, "key", key,
+				"received", size, "error", err)
+			writeObjectFailure(w, errIncompleteBody)
 			return
 		}
 		g.logger.Error("put object: write failed", "bucket", bucket, "key", key, "error", err)
@@ -877,23 +1005,25 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	// Rename temp file to final path.
-	if err := fileops.Publish(g.rootDir, tmpPath, op); err != nil {
-		os.Remove(tmpPath)
-		g.logger.Error("put object: rename failed", "bucket", bucket, "key", key, "error", err)
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to finalize object")
-		return
-	}
-
-	info, err := os.Stat(op)
+	// Rename the temp file over the object; a conditional write is decided here,
+	// in the same root-lock hold as the rename.
+	info, err := fileops.PublishIf(g.rootDir, tmpPath, op, conditions.precondition())
 	if err != nil {
-		g.logger.Error("put object: stat failed", "bucket", bucket, "key", key, "error", err)
+		os.Remove(tmpPath)
+		if failure := publishFailure(err, op); failure != nil {
+			g.logger.Info("put object: refused", "bucket", bucket, "key", key, "code", failure.code)
+			writeObjectFailure(w, failure)
+			return
+		}
+		g.logger.Error("put object: rename failed", "bucket", bucket, "key", key, "error", err)
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to finalize object")
 		return
 	}
 
 	g.logger.Info("object created", "bucket", bucket, "key", key, "size", size)
 
+	// The ETag of the generation this request published, which is what a HEAD
+	// reports for it, whatever was written after it.
 	w.Header().Set("ETag", etagFor(info))
 	body.setChecksumHeader(w)
 	w.WriteHeader(http.StatusOK)
@@ -903,6 +1033,11 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 func (g *Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if !validateBucketName(bucket) {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid argument")
+		return
+	}
+	// Deleting a missing key is a success, but only in a bucket that exists.
+	if !g.bucketExists(bucket) {
+		writeObjectFailure(w, errNoSuchBucket)
 		return
 	}
 	if failure := g.deleteObject(bucket, key); failure != nil {
@@ -964,6 +1099,28 @@ const (
 // keys of S3's longest, 1024 bytes each, fit even with every character escaped.
 const maxDeleteObjectsBody = 8 << 20
 
+// checkBodyDigests holds a buffered request body (DeleteObjects,
+// CompleteMultipartUpload) to the digests its request declares: Content-MD5,
+// and a concrete x-amz-content-sha256, which is what a SigV4 signature covers.
+// A body that says what to do is as worth protecting as an object's bytes: a
+// captured signed request must not be replayable with another body.
+func checkBodyDigests(r *http.Request, body []byte) *objectFailure {
+	if declared := strings.TrimSpace(r.Header.Get("Content-MD5")); declared != "" {
+		want, err := base64.StdEncoding.DecodeString(declared)
+		if sum := md5.Sum(body); err != nil || !bytes.Equal(sum[:], want) {
+			return &objectFailure{http.StatusBadRequest, "BadDigest",
+				"The Content-MD5 you specified did not match what we received."}
+		}
+	}
+	if declared := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256"))); isHexSHA256(declared) {
+		if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != declared {
+			return &objectFailure{http.StatusBadRequest, "XAmzContentSHA256Mismatch",
+				"The provided 'x-amz-content-sha256' header does not match what was computed."}
+		}
+	}
+	return nil
+}
+
 // handleDeleteObjects deletes many objects of a bucket in one request, each as
 // DeleteObject would: a missing key counts as deleted, and a key that cannot be
 // deleted is reported in the result without failing the others.
@@ -994,20 +1151,9 @@ func (g *Gateway) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bu
 	// The body names what to delete, so it is held to its declared digests just
 	// as an object's body is: a captured signed request cannot be replayed with
 	// other keys.
-	if declared := strings.TrimSpace(r.Header.Get("Content-MD5")); declared != "" {
-		want, err := base64.StdEncoding.DecodeString(declared)
-		if sum := md5.Sum(body); err != nil || !bytes.Equal(sum[:], want) {
-			writeS3Error(w, http.StatusBadRequest, "BadDigest",
-				"The Content-MD5 you specified did not match what we received.")
-			return
-		}
-	}
-	if declared := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Amz-Content-Sha256"))); isHexSHA256(declared) {
-		if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != declared {
-			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch",
-				"The provided 'x-amz-content-sha256' header does not match what was computed.")
-			return
-		}
+	if failure := checkBodyDigests(r, body); failure != nil {
+		writeObjectFailure(w, failure)
+		return
 	}
 
 	var request DeleteObjectsRequest
@@ -1019,8 +1165,10 @@ func (g *Gateway) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bu
 
 	result := DeleteObjectsResult{Xmlns: s3Xmlns}
 	for _, object := range request.Objects {
-		failure := &objectFailure{http.StatusBadRequest, "KeyTooLongError", "Your key is too long"}
-		if len(object.Key) <= maxKeyLength {
+		// Each key of the body is held to the rules the route applies to the key
+		// of a URL, so that it is deleted exactly as DeleteObject would be.
+		failure := keyFailure(object.Key)
+		if failure == nil {
 			failure = g.deleteObject(bucket, object.Key)
 		}
 		if failure != nil {

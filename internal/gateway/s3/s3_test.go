@@ -110,6 +110,27 @@ func TestAuth_V4BadSignature(t *testing.T) {
 	}
 }
 
+// An access key without its secret (or a secret without its key) used to
+// verify signatures made with the empty half: anyone who saw the key in a
+// presigned URL had full access.
+func TestAuth_HalfConfiguredKeyPairAdmitsNobody(t *testing.T) {
+	for _, cfg := range []Config{{AccessKey: "admin"}, {SecretKey: "secret"}} {
+		g, _ := testGateway(t, cfg)
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "example.com"
+		signV4Header(req, cfg.AccessKey, cfg.SecretKey)
+		w := httptest.NewRecorder()
+		g.route(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%+v: expected 403 for a request signed with the configured half, got %d", cfg, w.Code)
+		}
+		presigned := presignV4(http.MethodGet, "/", "example.com", cfg.AccessKey, cfg.SecretKey, 900)
+		if w := serveRequest(g, http.MethodGet, presigned, nil, map[string]string{"Host": "example.com"}); w.Code != http.StatusForbidden {
+			t.Fatalf("%+v: expected 403 for a presigned request, got %d", cfg, w.Code)
+		}
+	}
+}
+
 func TestAuth_InvalidAccessKey(t *testing.T) {
 	g, _ := testGateway(t, Config{AccessKey: "admin", SecretKey: "secret"})
 

@@ -1,15 +1,21 @@
 package httpui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/solkin/sebastian/internal/fileops"
@@ -18,6 +24,9 @@ import (
 
 const defaultPageSize = 100
 const maxPageSize = 1000
+
+// listBatch is how many directory entries one read returns while listing.
+const listBatch = 4096
 
 // fileEntry represents a single file or directory in a listing response.
 type fileEntry struct {
@@ -34,17 +43,24 @@ type listResponse struct {
 	Total   int         `json:"total"`
 }
 
-// resolvePath validates a relative path and returns the full filesystem path.
-// Returns an error for paths that escape rootDir.
-func (g *Gateway) resolvePath(relPath string) (string, error) {
-	_, fullPath, err := gateway.SafePath(g.rootDir, relPath)
-	return fullPath, err
+// errNULByte rejects a path no file can have before it reaches the filesystem,
+// where it would fail as an I/O error.
+var errNULByte = errors.New("path contains a NUL byte")
+
+// resolvePath validates a client path and returns its cleaned root-relative
+// form ("" for the root itself) and the full filesystem path. It returns an
+// error for paths that escape rootDir or enter a reserved namespace.
+func (g *Gateway) resolvePath(relPath string) (rel, full string, err error) {
+	if strings.IndexByte(relPath, 0) >= 0 {
+		return "", "", errNULByte
+	}
+	return gateway.SafePath(g.rootDir, relPath)
 }
 
 // handleList returns a paginated JSON listing of a directory.
 // Query parameters: path, offset (default 0), limit (default 100, max 1000).
-// Entries are sorted: directories first, then files, alphabetically within each group.
-// Info() (stat syscall) is only called for entries on the current page.
+// Entries are sorted: directories first, then files, by name within each group.
+// Only the entries on the requested page are stat'ed.
 func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 	dirPath := r.URL.Query().Get("path")
 	offset := parseIntParam(r, "offset", 0)
@@ -56,14 +72,18 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 		limit = defaultPageSize
 	}
 
-	fullPath, err := g.resolvePath(dirPath)
+	dirRel, fullPath, err := g.resolvePath(dirPath)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, err.Error())
+		g.invalidPath(w, dirPath, err)
 		return
 	}
 
 	info, err := os.Stat(fullPath)
 	if err != nil {
+		if invalidName(err) {
+			g.invalidPath(w, dirPath, err)
+			return
+		}
 		jsonError(w, http.StatusNotFound, "directory not found")
 		return
 	}
@@ -72,45 +92,47 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawEntries, err := os.ReadDir(fullPath)
+	// Reading a directory of hundreds of thousands of names costs real time and
+	// memory, and every page reads it whole. Bound how many run at once so a
+	// burst of requests cannot take the server's memory with it; the rest wait
+	// for a slot unless the client goes away.
+	select {
+	case g.listSem <- struct{}{}:
+		defer func() { <-g.listSem }()
+	case <-r.Context().Done():
+		return
+	}
+
+	dirs, files, err := g.visibleNames(fullPath, dirRel)
 	if err != nil {
+		g.logger.Error("list failed", "path", dirRel, "error", err)
 		jsonError(w, http.StatusInternalServerError, "failed to read directory")
 		return
 	}
 
-	var dirs, files []os.DirEntry
-	for _, e := range rawEntries {
-		if !gateway.IsClientVisiblePath(g.rootDir, filepath.Join(fullPath, e.Name())) {
-			continue
-		}
-		if e.IsDir() {
-			dirs = append(dirs, e)
-		} else {
-			files = append(files, e)
-		}
-	}
-
 	total := len(dirs) + len(files)
 
+	// Build the page slice from the logical concatenation dirs+files.
+	// Only stat the entries on the current page.
 	var result []fileEntry
 	end := offset + limit
 	if end > total {
 		end = total
 	}
 	for i := offset; i < end; i++ {
-		var e os.DirEntry
-		if i < len(dirs) {
-			e = dirs[i]
+		name, isDir := "", i < len(dirs)
+		if isDir {
+			name = dirs[i]
 		} else {
-			e = files[i-len(dirs)]
+			name = files[i-len(dirs)]
 		}
-		fi, err := e.Info()
+		fi, err := os.Lstat(filepath.Join(fullPath, name))
 		if err != nil {
 			continue
 		}
 		result = append(result, fileEntry{
-			Name:    e.Name(),
-			IsDir:   e.IsDir(),
+			Name:    name,
+			IsDir:   isDir,
 			Size:    fi.Size(),
 			ModTime: fi.ModTime().UTC().Format(time.RFC3339),
 		})
@@ -130,6 +152,59 @@ func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// visibleNames returns the names of the visible subdirectories and of the
+// other visible entries of the directory at fullPath, each sorted by name as
+// os.ReadDir sorts them. dirRel is the directory's root-relative path, already
+// validated by SafePath.
+//
+// Visibility is decided from the name and the entry type the directory read
+// returned, without a stat per entry; only a symlink is looked up, because
+// where it leads decides whether it may be shown. Entries are read in batches
+// and only the names of visible ones are kept.
+func (g *Gateway) visibleNames(fullPath, dirRel string) (dirs, files []string, err error) {
+	d, err := os.Open(fullPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer d.Close()
+	for {
+		batch, err := d.ReadDir(listBatch)
+		for _, e := range batch {
+			name := e.Name()
+			if !g.visibleName(dirRel, name) {
+				continue
+			}
+			typ := e.Type()
+			if typ&fs.ModeSymlink != 0 && !gateway.IsClientVisiblePath(g.rootDir, filepath.Join(fullPath, name)) {
+				continue
+			}
+			if typ.IsDir() {
+				dirs = append(dirs, name)
+			} else {
+				files = append(files, name)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	slices.Sort(dirs)
+	slices.Sort(files)
+	return dirs, files, nil
+}
+
+// visibleName applies the namespace rules of gateway.IsClientVisiblePath to
+// one entry of a listed directory, from its name alone: the reserved state
+// directory at the root and the scratch files anywhere. For anything but a
+// symlink the two agree exactly (TestList_VisibleNameMatchesGateway keeps
+// them so). No directory entry can hold a NUL; it is refused all the same.
+func (g *Gateway) visibleName(dirRel, name string) bool {
+	return gateway.ClientVisibleName(dirRel, name)
+}
+
 func parseIntParam(r *http.Request, name string, defaultVal int) int {
 	s := r.URL.Query().Get(name)
 	if s == "" {
@@ -146,24 +221,33 @@ func parseIntParam(r *http.Request, name string, defaultVal int) int {
 func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 	filePath := strings.TrimPrefix(r.URL.Path, "/_api/dl/")
 
-	fullPath, err := g.resolvePath(filePath)
+	rel, fullPath, err := g.resolvePath(filePath)
 	if err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
-	info, err := os.Stat(fullPath)
-	if err != nil || info.IsDir() {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-
 	f, err := os.Open(fullPath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || invalidName(err) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		g.logger.Error("download failed", "path", rel, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		g.logger.Error("download failed", "path", rel, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 
 	// Build the header via mime.FormatMediaType so a filename containing quotes,
 	// control characters, or non-ASCII cannot break out of the header value
@@ -174,117 +258,61 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 		disposition = "attachment"
 	}
 	w.Header().Set("Content-Disposition", disposition)
-	http.ServeContent(w, r, name, info.ModTime(), f)
+	g.serveDownload(w, r, rel, info.ModTime(), f)
 }
 
-// handleUpload accepts multipart file uploads.
-func (g *Gateway) handleUpload(w http.ResponseWriter, r *http.Request) {
-	// Bound concurrent uploads; wait for a slot unless the client goes away.
-	select {
-	case g.uploadSem <- struct{}{}:
-		defer func() { <-g.uploadSem }()
-	case <-r.Context().Done():
-		return
-	}
+// serveDownload streams content and logs how the transfer ended. ServeContent
+// reports nothing itself. A failed read of the file is the server's failure; a
+// client that stops reading is routine — browsers cancel and re-request ranges
+// all the time — and is not worth more than Debug.
+func (g *Gateway) serveDownload(w http.ResponseWriter, r *http.Request, rel string, modTime time.Time, content io.ReadSeeker) {
+	tracked := &readFailures{ReadSeeker: content}
+	http.ServeContent(w, r, path.Base(rel), modTime, tracked)
 
-	limit := int64(defaultMaxUploadBytes)
-	if g.config.MaxUploadBytes > 0 {
-		limit = g.config.MaxUploadBytes
+	switch err := tracked.failure(); {
+	case err != nil:
+		g.logger.Error("download read failed", "path", rel, "error", err)
+	case r.Context().Err() != nil:
+		g.logger.Debug("download aborted by client", "path", rel, "error", context.Cause(r.Context()))
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+}
 
-	// Keep only a small part in memory; larger parts spill to temp files, which
-	// RemoveAll cleans up. This bounds RAM per upload regardless of body size.
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		jsonError(w, http.StatusBadRequest, "failed to parse upload")
-		return
+// readFailures records the first failure reading the served file. It may be
+// read from a goroutine ServeContent leaves behind for a multi-range response.
+type readFailures struct {
+	io.ReadSeeker
+	mu  sync.Mutex
+	err error
+}
+
+func (c *readFailures) Read(p []byte) (int, error) {
+	n, err := c.ReadSeeker.Read(p)
+	if err != nil && err != io.EOF {
+		c.record(err)
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			r.MultipartForm.RemoveAll()
-		}
-	}()
+	return n, err
+}
 
-	targetDir := r.FormValue("path")
-	dirFullPath, err := g.resolvePath(targetDir)
+func (c *readFailures) Seek(offset int64, whence int) (int64, error) {
+	n, err := c.ReadSeeker.Seek(offset, whence)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, err.Error())
-		return
+		c.record(err)
 	}
+	return n, err
+}
 
-	if err := fileops.Mkdir(g.rootDir, dirFullPath, 0o755, true); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to create directory")
-		return
+func (c *readFailures) record(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err == nil {
+		c.err = err
 	}
+}
 
-	files := r.MultipartForm.File["files"]
-	if len(files) == 0 {
-		jsonError(w, http.StatusBadRequest, "no files provided")
-		return
-	}
-
-	relpaths := r.MultipartForm.Value["relpaths"]
-
-	for i, fh := range files {
-		name := fh.Filename
-		if i < len(relpaths) && relpaths[i] != "" {
-			name = relpaths[i]
-		}
-
-		cleanName := filepath.ToSlash(filepath.Clean(name))
-		cleanName = strings.TrimPrefix(cleanName, "/")
-		if cleanName == "" || cleanName == "." || strings.HasPrefix(cleanName, "../") {
-			jsonError(w, http.StatusBadRequest, "invalid file name")
-			return
-		}
-
-		destPath, err := g.resolvePath(path.Join(targetDir, cleanName))
-		if err != nil {
-			jsonError(w, http.StatusBadRequest, "invalid file name")
-			return
-		}
-
-		destDir := filepath.Dir(destPath)
-		if err := fileops.Mkdir(g.rootDir, destDir, 0o755, true); err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to create directory")
-			return
-		}
-
-		src, err := fh.Open()
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to read uploaded file")
-			return
-		}
-
-		dst, err := fileops.CreateTemp(destDir, ".seb-tmp-upload-*")
-		if err != nil {
-			src.Close()
-			jsonError(w, http.StatusInternalServerError, "failed to create file")
-			return
-		}
-		defer fileops.ReleaseTemp(dst)
-		tmpPath := dst.Name()
-
-		_, copyErr := io.Copy(dst, src)
-		src.Close()
-		dst.Close()
-
-		if copyErr != nil {
-			os.Remove(tmpPath)
-			jsonError(w, http.StatusInternalServerError, "failed to write file")
-			return
-		}
-
-		if err := fileops.Publish(g.rootDir, tmpPath, destPath); err != nil {
-			os.Remove(tmpPath)
-			jsonError(w, http.StatusInternalServerError, "failed to save file")
-			return
-		}
-
-		g.logger.Info("file uploaded", "name", cleanName, "dir", targetDir)
-	}
-
-	jsonOK(w)
+func (c *readFailures) failure() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
 }
 
 // handleMkdir creates a directory.
@@ -301,14 +329,14 @@ func (g *Gateway) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fullPath, err := g.resolvePath(req.Path)
+	rel, fullPath, err := g.resolvePath(req.Path)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, err.Error())
+		g.invalidPath(w, req.Path, err)
 		return
 	}
 
 	if err := fileops.Mkdir(g.rootDir, fullPath, 0o755, true); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to create directory")
+		g.mutationFailed(w, "mkdir", rel, err, "failed to create directory")
 		return
 	}
 
@@ -331,30 +359,48 @@ func (g *Gateway) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fromFull, err := g.resolvePath(req.From)
+	fromRel, fromFull, err := g.resolvePath(req.From)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid source: "+err.Error())
+		g.logger.Debug("rename refused", "from", req.From, "error", err)
+		jsonError(w, http.StatusBadRequest, "invalid source path")
 		return
 	}
 
-	toFull, err := g.resolvePath(req.To)
+	toRel, toFull, err := g.resolvePath(req.To)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid destination: "+err.Error())
+		g.logger.Debug("rename refused", "to", req.To, "error", err)
+		jsonError(w, http.StatusBadRequest, "invalid destination path")
+		return
+	}
+
+	// A path such as "apps/.." cleans to the root itself, which is never
+	// renamed and never replaced.
+	if fromRel == "" {
+		jsonError(w, http.StatusBadRequest, "cannot rename root directory")
+		return
+	}
+	if toRel == "" {
+		jsonError(w, http.StatusBadRequest, "invalid destination path")
 		return
 	}
 
 	if _, err := os.Stat(fromFull); err != nil {
+		if invalidName(err) {
+			g.mutationFailed(w, "rename", fromRel, err, "")
+			return
+		}
 		jsonError(w, http.StatusNotFound, "source not found")
 		return
 	}
 
+	// Ensure parent directory of destination exists.
 	if err := fileops.Mkdir(g.rootDir, filepath.Dir(toFull), 0o755, true); err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to create parent directory")
+		g.mutationFailed(w, "rename", toRel, err, "failed to create parent directory")
 		return
 	}
 
 	if err := fileops.Rename(g.rootDir, fromFull, toFull); err != nil {
-		jsonError(w, http.StatusInternalServerError, "rename failed: "+err.Error())
+		g.mutationFailed(w, "rename", fromRel+" -> "+toRel, err, "rename failed")
 		return
 	}
 
@@ -377,24 +423,84 @@ func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fullPath, err := g.resolvePath(req.Path)
+	rel, fullPath, err := g.resolvePath(req.Path)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, err.Error())
+		g.invalidPath(w, req.Path, err)
+		return
+	}
+	// "apps/.." and the like clean to the root itself. Removing it would
+	// delete the whole served directory.
+	if rel == "" {
+		jsonError(w, http.StatusBadRequest, "cannot delete root directory")
 		return
 	}
 
 	if _, err := os.Stat(fullPath); err != nil {
+		if invalidName(err) {
+			g.mutationFailed(w, "delete", rel, err, "")
+			return
+		}
 		jsonError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	if err := fileops.Remove(g.rootDir, fullPath, true); err != nil {
-		jsonError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+		g.mutationFailed(w, "delete", rel, err, "delete failed")
 		return
 	}
 
 	g.logger.Info("deleted", "path", req.Path)
 	jsonOK(w)
+}
+
+// invalidPath answers a path that resolvePath refused. Its reason stays in the
+// log: it can name absolute paths.
+func (g *Gateway) invalidPath(w http.ResponseWriter, requested string, err error) {
+	g.logger.Debug("invalid path", "path", requested, "error", err)
+	jsonError(w, http.StatusBadRequest, "invalid path")
+}
+
+// mutationFailed answers a failed change to the volume. The client gets a
+// status that says whose mistake it was and a message without filesystem
+// paths (see failureStatus); the log gets the error itself — at Error when the
+// server failed, at Debug when the request could never have succeeded.
+func (g *Gateway) mutationFailed(w http.ResponseWriter, op, name string, err error, fallback string) {
+	status, msg := failureStatus(err, fallback)
+	if status >= http.StatusInternalServerError {
+		g.logger.Error(op+" failed", "path", name, "error", err)
+	} else {
+		g.logger.Debug(op+" refused", "path", name, "status", status, "error", err)
+	}
+	jsonError(w, status, msg)
+}
+
+// failureStatus maps a failed filesystem operation to a status and a generic
+// message. The error text itself is never sent: it names absolute paths. A
+// name the volume cannot hold is a bad request and a clash with what is there
+// is a conflict; anything else is the server's failure, reported as fallback.
+func failureStatus(err error, fallback string) (int, string) {
+	switch {
+	case invalidName(err):
+		return http.StatusBadRequest, "invalid path"
+	case errors.Is(err, fs.ErrNotExist):
+		return http.StatusNotFound, "not found"
+	case errors.Is(err, fs.ErrExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR):
+		return http.StatusConflict, "conflicts with an existing file or directory"
+	}
+	if fallback == "" {
+		fallback = "operation failed"
+	}
+	return http.StatusInternalServerError, fallback
+}
+
+// invalidName reports whether err says a name cannot exist on the volume: it
+// holds a NUL byte, or the filesystem refuses it (EINVAL, ENAMETOOLONG, EILSEQ
+// for bytes it cannot store).
+func invalidName(err error) bool {
+	return errors.Is(err, errNULByte) ||
+		errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.ENAMETOOLONG) ||
+		errors.Is(err, syscall.EILSEQ)
 }
 
 func jsonOK(w http.ResponseWriter) {

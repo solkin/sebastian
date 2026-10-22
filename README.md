@@ -6,32 +6,40 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 
 ## Features
 
-- **S3-compatible API** — path-style and virtual-hosted-style addressing, ListBuckets, GetObject, PutObject, DeleteObject, DeleteObjects, ListObjectsV1/V2
-- **S3 multipart uploads** — CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads; crash-safe staging, TTL cleanup, and per-part checksums
+- **S3-compatible API** — path-style and virtual-hosted-style addressing, ListBuckets, GetObject, PutObject, CopyObject, DeleteObject, DeleteObjects, ListObjectsV1/V2, conditional requests, folder markers
+- **S3 multipart uploads** — CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads; crash-safe staging, TTL cleanup, per-part checksums and idempotent completion
 - **WebDAV** — full PROPFIND/GET/PUT/DELETE/MKCOL/MOVE/COPY/LOCK/UNLOCK support, compatible with macOS Finder, Windows Explorer, Cyberduck, rclone
 - **SFTP** — SSH File Transfer Protocol v3, compatible with OpenSSH sftp, FileZilla, WinSCP
 - **HTTP UI** — Material 3 styled web file browser with upload, download, rename, delete, drag-and-drop folder upload
 - **Durable atomic uploads** — HTTP, WebDAV PUT and S3 publish flushed temporary files by rename; SFTP writes directly to open files
 - **Recoverable COPY/MOVE** — private copy staging and filesystem journals preserve replaced data across process crashes
 - **Path traversal protection** — three-layer defense (textual check + absolute path verification + symlink-escape resolution), applied uniformly across all gateways
+- **Fails closed** — an enabled gateway refuses to start without both of its credentials unless anonymous access is requested explicitly
 
 ## Quick Start
 
-Current release: **v1.6.1**. Read the [release and upgrade notes](docs/releases/v1.6.1.md)
-before upgrading an existing server.
+Current release: **v1.7.0**. Read the [release and upgrade notes](docs/releases/v1.7.0.md)
+before upgrading an existing server: v1.7.0 refuses configurations that earlier
+releases accepted with only a warning.
 
 ### Docker
 
 ```bash
 docker run -d \
-  -p 9200:9200 -p 9300:9300 -p 9400:9400 -p 9500:9500 \
+  -p 127.0.0.1:9200:9200 -p 127.0.0.1:9400:9400 \
   -v /path/to/files:/data/files \
-  -e SEBASTIAN_S3_ENABLED=true \
-  -e SEBASTIAN_HTTP_ENABLED=true \
-  solkin/sebastian
+  -e SEBASTIAN_S3_ACCESS_KEY=choose-a-key -e SEBASTIAN_S3_SECRET_KEY=choose-a-secret \
+  -e SEBASTIAN_HTTP_USERNAME=admin -e SEBASTIAN_HTTP_PASSWORD=choose-a-password \
+  solkin/sebastian:1.7.0
 ```
 
 Open http://localhost:9400 for the web UI. Use any S3 client against http://localhost:9200.
+
+The image enables S3 and the web UI. An enabled gateway needs both of its
+credentials; Sebastian refuses to start otherwise. To serve a gateway without
+authentication on purpose, set its `allow_anonymous: true`
+(`SEBASTIAN_S3_ALLOW_ANONYMOUS=true`, `SEBASTIAN_HTTP_ALLOW_ANONYMOUS=true`).
+`sebastiand -version` prints the release.
 
 ### Binary
 
@@ -48,6 +56,7 @@ Sebastian can be configured via a YAML file, environment variables, or both. Env
 
 ```yaml
 root_dir: /data/files
+access_log: true              # one line per request
 max_upload_bytes: 0           # cap a single upload (bytes); 0 = unlimited for S3/WebDAV/SFTP, 1 GiB default for HTTP UI
 
 multipart:                    # S3 multipart upload limits and retention
@@ -64,8 +73,9 @@ gateways:
   s3:
     enabled: true
     listen_addr: ":9200"
-    access_key: ""
-    secret_key: ""
+    access_key: "choose-a-key"
+    secret_key: "choose-a-secret"
+    # allow_anonymous: true   # the only way to serve an enabled gateway without credentials
     domain: ""
     buckets: []               # created at startup when missing
   webdav:
@@ -76,12 +86,12 @@ gateways:
   http:
     enabled: true
     listen_addr: ":9400"
-    username: ""
-    password: ""
+    username: "admin"
+    password: "choose-a-password"
   sftp:
     enabled: false
     listen_addr: ":9500"
-    username: ""              # client auth (empty = anonymous)
+    username: ""              # client auth; both empty needs allow_anonymous: true
     password: ""              # client auth
     host_key_path: "/etc/sebastian/sftp_host_key"  # server identity key (required)
 ```
@@ -91,6 +101,7 @@ gateways:
 | Variable | Description | Default |
 |---|---|---|
 | `SEBASTIAN_ROOT_DIR` | Root directory to serve | `/data/files` |
+| `SEBASTIAN_ACCESS_LOG` | One info line per request (method, URL without credentials, status, size, duration, client address, `X-Forwarded-For`) | `true` |
 | `SEBASTIAN_MAX_UPLOAD_BYTES` | Max size of a single upload in bytes (`0` = unlimited for S3/WebDAV/SFTP; HTTP UI defaults to 1 GiB) | `0` |
 | `SEBASTIAN_MULTIPART_MIN_PART_BYTES` | Minimum size of every multipart part but the last | `5242880` (5 MiB) |
 | `SEBASTIAN_MULTIPART_MAX_PART_BYTES` | Maximum size of a single multipart part | `5368709120` (5 GiB) |
@@ -102,25 +113,47 @@ gateways:
 | `SEBASTIAN_MULTIPART_TEMP_FILE_MAX_AGE` | Age at which an orphaned scratch file is removed (duration) | `24h` |
 | `SEBASTIAN_S3_ENABLED` | Enable S3 gateway | `false` |
 | `SEBASTIAN_S3_LISTEN_ADDR` | S3 listen address | `:9200` |
-| `SEBASTIAN_S3_ACCESS_KEY` | S3 access key (empty = no auth) | |
+| `SEBASTIAN_S3_ACCESS_KEY` | S3 access key | |
 | `SEBASTIAN_S3_SECRET_KEY` | S3 secret key | |
+| `SEBASTIAN_S3_ALLOW_ANONYMOUS` | Serve S3 without credentials | `false` |
 | `SEBASTIAN_S3_DOMAIN` | Base domain for virtual-hosted-style S3 (empty = path-style only) | |
 | `SEBASTIAN_S3_BUCKETS` | Comma-separated buckets to create at startup when missing | |
 | `SEBASTIAN_WEBDAV_ENABLED` | Enable WebDAV gateway | `false` |
 | `SEBASTIAN_WEBDAV_LISTEN_ADDR` | WebDAV listen address | `:9300` |
-| `SEBASTIAN_WEBDAV_USERNAME` | WebDAV username (empty = no auth) | |
+| `SEBASTIAN_WEBDAV_USERNAME` | WebDAV username | |
 | `SEBASTIAN_WEBDAV_PASSWORD` | WebDAV password | |
+| `SEBASTIAN_WEBDAV_ALLOW_ANONYMOUS` | Serve WebDAV without credentials | `false` |
 | `SEBASTIAN_HTTP_ENABLED` | Enable HTTP UI gateway | `false` |
 | `SEBASTIAN_HTTP_LISTEN_ADDR` | HTTP UI listen address | `:9400` |
-| `SEBASTIAN_HTTP_USERNAME` | HTTP UI username (empty = no auth) | |
+| `SEBASTIAN_HTTP_USERNAME` | HTTP UI username | |
 | `SEBASTIAN_HTTP_PASSWORD` | HTTP UI password | |
+| `SEBASTIAN_HTTP_ALLOW_ANONYMOUS` | Serve the web UI without credentials | `false` |
 | `SEBASTIAN_SFTP_ENABLED` | Enable SFTP gateway | `false` |
 | `SEBASTIAN_SFTP_LISTEN_ADDR` | SFTP listen address | `:9500` |
-| `SEBASTIAN_SFTP_USERNAME` | SFTP username for client auth (empty = anonymous access) | |
+| `SEBASTIAN_SFTP_USERNAME` | SFTP username for client auth | |
 | `SEBASTIAN_SFTP_PASSWORD` | SFTP password for client auth | |
+| `SEBASTIAN_SFTP_ALLOW_ANONYMOUS` | Accept SFTP connections without a password | `false` |
 | `SEBASTIAN_SFTP_HOST_KEY_PATH` | Path to server identity key file (required, auto-generated on first run) | |
 
 At least one gateway must be enabled. When SFTP is enabled, `host_key_path` must be explicitly set.
+
+Startup fails closed:
+
+- An enabled gateway needs both credentials (`access_key`/`secret_key`,
+  `username`/`password`). With neither, it starts only with
+  `allow_anonymous: true`, and a warning is logged; one credential alone is
+  always an error, because an empty secret or password is a value anyone can
+  use. Values starting with `changeme` are rejected as examples.
+- A nonempty environment value that does not parse (a number, duration or
+  boolean — `true`/`false`, `yes`/`no`, `1`/`0`) stops startup instead of
+  falling back to the default.
+- A gateway that fails, such as one whose port is taken, stops the server with
+  a nonzero exit status.
+
+On SIGTERM open transfers get 8 seconds to finish; give a container runtime more
+than that before it sends SIGKILL (`stop_grace_period: 30s` in compose). Every
+gateway abandons a transfer that makes no progress for five minutes in either
+direction; a slow transfer that keeps moving is not cut off.
 
 ### Upload limit defaults
 
@@ -135,7 +168,7 @@ browser retains its 1 GiB default request limit.
 SFTP runs over SSH, which requires two separate mechanisms:
 
 - **Server identity key** (`host_key_path`) — the server's cryptographic identity, similar to a TLS certificate. SSH clients verify this key to ensure they are connecting to the correct server. The key file is auto-generated on first startup if it does not exist at the specified path (a warning is logged when this happens). Keep the same file across restarts to avoid "host key changed" warnings in clients — in Docker, mount a volume covering the key path (the image stores it at `/data/sftp_host_key` and declares `/data` as a volume, so a named volume like `-v sebastian-data:/data` persists it across container recreation).
-- **Client authentication** (`username` / `password`) — credentials that clients must provide to connect. If both are empty, any client can connect without authentication.
+- **Client authentication** (`username` / `password`) — credentials that clients must provide to connect. Both are required; with both empty the gateway starts only with `allow_anonymous: true`, and then any client can connect. One of them alone admits nobody.
 
 #### Connecting
 
@@ -143,7 +176,7 @@ SFTP runs over SSH, which requires two separate mechanisms:
 # With authentication:
 sftp -P 9500 user@localhost
 
-# Without authentication (if username/password are empty):
+# Without authentication (allow_anonymous: true):
 sftp -P 9500 -o User=anonymous localhost
 ```
 
@@ -169,6 +202,31 @@ written through any protocol.
 Buckets listed in `buckets` (`SEBASTIAN_S3_BUCKETS`) are created at startup when
 missing, so they exist before a client that does not create buckets, such as a
 backup tool, first uses one. A name that cannot be a bucket stops startup.
+
+## S3 Copies, Folders and Conditional Requests
+
+- **CopyObject** (`x-amz-copy-source`) copies the source into a scratch file next
+  to the destination and publishes it atomically; a source replaced during the
+  copy answers `503 SlowDown` (SDKs retry). Copying an object onto itself
+  (`--metadata-directive REPLACE`) changes nothing, as metadata is not stored.
+  `x-amz-copy-source-if-*` conditions are honoured; `versionId` is not supported.
+- **UploadPartCopy** copies a byte range (`x-amz-copy-source-range`) into a part,
+  so `aws s3 cp`/`mv` between keys works for objects of any size.
+- **Folder markers**: `PUT bucket/prefix/` with an empty body creates the
+  directory; `HEAD`/`GET` of `prefix/` answer `200` while it exists; `DELETE
+  prefix/` removes it only when empty.
+- **Conditional requests**: `GET`/`HEAD` evaluate `If-Match`,
+  `If-Unmodified-Since` (`412`), `If-None-Match` and `If-Modified-Since` (`304`);
+  an unsatisfiable range answers `416 InvalidRange`. `PUT` and Complete with
+  `If-None-Match: *` or `If-Match` are decided atomically at publication.
+- **Errors** keep S3 codes: `NoSuchBucket`, `KeyTooLongError`, `ParentIsObject`,
+  `ObjectExistsAsDirectory`, `InvalidArgument` for NUL or invalid UTF-8 keys. An
+  upload whose declared length exceeds `max_upload_bytes` is refused with `413`
+  before its body is sent.
+- **Content-Type** is derived from the extension for a safe set (`.apk`, common
+  images, `.json`, `.txt`, `.pdf`, `.zip`) and is `application/octet-stream` for
+  everything else, including HTML, SVG and scripts. Every response carries
+  `X-Content-Type-Options: nosniff`.
 
 ## S3 Batch Deletes
 
@@ -235,13 +293,15 @@ uploads cannot be deleted (`BucketNotEmpty`).
 
 ### ETag semantics
 
-`CompleteMultipartUpload` returns the standard composite ETag — the MD5 of the
-concatenated part digests, suffixed with `-{partCount}`. A later `GET`/`HEAD`/
-`LIST` of that object returns sebastian's usual ETag, which is derived from size
-and modification time rather than content (the same as for objects written with a
-plain `PUT`). Clients that compare a stored multipart ETag against a later `HEAD`
-will see a difference; nothing in the AWS SDKs' upload or download paths depends
-on it.
+Object ETags are derived from size and modification time rather than content.
+PutObject, CopyObject and CompleteMultipartUpload return the same ETag that a
+later `GET`, `HEAD` or `LIST` reports for that object. Part ETags in UploadPart,
+UploadPartCopy, ListParts and Complete are the parts' MD5.
+
+Repeating `CompleteMultipartUpload` with the same part list — a client retry after
+a timeout — returns the original result while the object is unchanged and within
+`upload_ttl`, instead of `NoSuchUpload`. The Complete request body is checked
+against `Content-MD5` and a concrete `x-amz-content-sha256`.
 
 Plain `PutObject` also validates `Content-MD5` and a concrete
 `x-amz-content-sha256`. A checksum mismatch rejects the upload without replacing
@@ -254,7 +314,10 @@ Version 4 — either via the `Authorization` header or presigned query parameter
 Any S3 SDK or tool configured with the same credentials works out of the box.
 
 - Legacy Signature V2 (`AWS key:signature`) is not supported.
-- Presigned URLs are validated against their `X-Amz-Expires` window.
+- Presigned URLs are validated against their `X-Amz-Expires` window, which may
+  not exceed 7 days (604800 seconds); the credential scope date must match
+  `X-Amz-Date`.
+- An access key without its secret key (or the reverse) admits nobody.
 - When a client sends a concrete `x-amz-content-sha256` digest, uploads are
   re-hashed and rejected on mismatch, so a captured signed request cannot be
   replayed with a swapped body. Signed streaming bodies additionally verify
@@ -290,6 +353,20 @@ original `Host` header — the HTTP UI's CSRF protection compares the request
 
 The container image runs as a non-root user; bind-mounted data directories must
 be writable by that user.
+
+[`docker-compose.yml`](docker-compose.yml) pins a release, requires every
+credential from `.env`, waits 30 s on stop and rotates logs.
+[`deploy/nginx.sebastian.conf.example`](deploy/nginx.sebastian.conf.example)
+streams uploads and downloads without spooling them to the proxy's disk, keeps
+upstream connections alive and re-resolves the container after it is recreated.
+
+The access log writes one info line per request with the method, the URL
+without presigned credentials, status, size, duration, client address and
+`X-Forwarded-For`. Rotate the container log or set `access_log: false`.
+
+Objects uploaded with `aws-chunked` bodies through v1.6.0 or earlier may hold
+the chunk framing instead of their content; `docker exec sebastian
+find-aws-chunked` lists candidates to compare with their originals.
 
 ## Building
 

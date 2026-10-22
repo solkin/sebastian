@@ -75,12 +75,19 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 	}
 
 	// Authentication is required whenever a username OR password is configured.
-	// Using "||" (not "&&") keeps a half-filled config fail-closed: a config that
-	// sets only one field must still match it, instead of silently accepting every
-	// client. Only an entirely empty credential disables auth (the documented
+	// Using "||" (not "&&") keeps a half-filled config fail-closed, and such a
+	// config admits nobody: its empty half is not a credential a client may
+	// present. Only an entirely empty credential disables auth (the documented
 	// no-auth mode, consistent with the HTTP/WebDAV gateways).
 	if cfg.Username != "" || cfg.Password != "" {
+		halfConfigured := cfg.Username == "" || cfg.Password == ""
+		if halfConfigured {
+			g.logger.Warn("SFTP username or password is empty; every login will be refused")
+		}
 		sshCfg.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if halfConfigured {
+				return nil, fmt.Errorf("authentication failed for %s", conn.User())
+			}
 			userOK := subtle.ConstantTimeCompare([]byte(conn.User()), []byte(cfg.Username))
 			passOK := subtle.ConstantTimeCompare(password, []byte(cfg.Password))
 			if userOK&passOK == 1 {

@@ -94,33 +94,35 @@ func TestMaxUploadBytesEnforced(t *testing.T) {
 	sftpClose(t, ch, 4, handle)
 }
 
-func TestAuthFailClosedUsernameOnly(t *testing.T) {
-	syncDir := t.TempDir()
-	addr := testGateway(t, syncDir, "user", "")
-
-	// Wrong password must be rejected (auth is enabled, not bypassed).
-	bad := &ssh.ClientConfig{
-		User:            "user",
-		Auth:            []ssh.AuthMethod{ssh.Password("not-empty")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
+// A half-configured credential (a username without a password, or the
+// reverse) admits nobody. It used to require the empty half literally, so a
+// client sending the configured username with an empty password got in.
+// Configuration validation refuses such a pair; this is defence in depth.
+func TestAuthFailClosedHalfConfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name, cfgUser, cfgPass string
+		tries                  [][2]string // user, password
+	}{
+		{"username only", "user", "", [][2]string{{"user", ""}, {"user", "not-empty"}, {"", ""}}},
+		{"password only", "", "pass", [][2]string{{"", "pass"}, {"user", "pass"}, {"", ""}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := testGateway(t, t.TempDir(), tc.cfgUser, tc.cfgPass)
+			for _, try := range tc.tries {
+				cfg := &ssh.ClientConfig{
+					User:            try[0],
+					Auth:            []ssh.AuthMethod{ssh.Password(try[1])},
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+					Timeout:         2 * time.Second,
+				}
+				conn, err := ssh.Dial("tcp", addr, cfg)
+				if err == nil {
+					conn.Close()
+					t.Fatalf("user %q with password %q was admitted", try[0], try[1])
+				}
+			}
+		})
 	}
-	if _, err := ssh.Dial("tcp", addr, bad); err == nil {
-		t.Fatal("expected auth failure for wrong password when only username configured")
-	}
-
-	// Correct credential (username + empty password) is accepted.
-	good := &ssh.ClientConfig{
-		User:            "user",
-		Auth:            []ssh.AuthMethod{ssh.Password("")},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         2 * time.Second,
-	}
-	conn, err := ssh.Dial("tcp", addr, good)
-	if err != nil {
-		t.Fatalf("expected success for correct credential: %v", err)
-	}
-	conn.Close()
 }
 
 func TestZeroLengthRead(t *testing.T) {

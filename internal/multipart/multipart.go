@@ -195,6 +195,13 @@ type CompleteResult struct {
 	ETag  string
 	Size  int64
 	Parts int
+	// Info is the stat of the generation the completion published, so a caller
+	// can describe exactly that object even if it is replaced right after.
+	Info os.FileInfo
+	// Repeated is set when the upload had already been completed with the same
+	// part list and the object is still the one it produced: a client retrying
+	// a completion whose answer it never received.
+	Repeated bool
 }
 
 // Store manages staged multipart uploads under a root directory.
@@ -795,7 +802,20 @@ func (s *Store) Abort(id string) error {
 //
 // dest must be an absolute path inside the store's root directory; the caller is
 // responsible for having resolved it safely.
+//
+// A completion is recorded for the upload TTL, so a client that retries it —
+// typically after a timeout while a large object was being assembled — gets the
+// same result instead of NoSuchUpload, as long as it names the same parts and
+// the object is still the one the completion produced.
 func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteResult, error) {
+	return s.CompleteIf(id, want, dest, nil)
+}
+
+// CompleteIf is Complete for a conditional write: precondition is handed the
+// destination's current stat under the root lock at publication, and a
+// non-nil result refuses the completion (see fileops.PublishIf). A refused
+// completion keeps the upload, so the client can retry or abort it.
+func (s *Store) CompleteIf(id string, want []CompletePart, dest string, precondition func(os.FileInfo, error) error) (CompleteResult, error) {
 	if !ValidUploadID(id) {
 		return CompleteResult{}, ErrNoSuchUpload
 	}
@@ -810,6 +830,11 @@ func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteR
 	defer s.unlock(id, l)
 
 	up, err := s.readMeta(id)
+	if errors.Is(err, ErrNoSuchUpload) {
+		// Already completed (perhaps by the very request this one retries, which
+		// held the lock until it was done) or never there.
+		return s.repeatCompletion(id, want, dest)
+	}
 	if err != nil {
 		return CompleteResult{}, err
 	}
@@ -856,9 +881,18 @@ func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteR
 		selected = append(selected, p)
 	}
 
-	etag, size, err := s.assemble(id, selected, total, dest)
+	etag, info, err := s.assemble(id, selected, total, dest, precondition)
 	if err != nil {
 		return CompleteResult{}, err
+	}
+	size := info.Size()
+
+	// Record the completion before the staging directory goes, so there is no
+	// moment at which a retry finds neither. Failing to record it only costs a
+	// retry its idempotency, never the object, so it does not fail the request.
+	if err := s.recordCompletion(up, want, dest, etag, info); err != nil {
+		s.logger.Warn("failed to record multipart completion; a retried completion will report NoSuchUpload",
+			"upload_id", id, "error", err)
 	}
 
 	if err := os.RemoveAll(s.uploadDir(id)); err != nil {
@@ -876,6 +910,7 @@ func (s *Store) Complete(id string, want []CompletePart, dest string) (CompleteR
 		ETag:   etag,
 		Size:   size,
 		Parts:  len(selected),
+		Info:   info,
 	}, nil
 }
 
@@ -911,25 +946,26 @@ func (s *Store) validateDest(dest string) error {
 }
 
 // assemble concatenates parts into dest and returns the composite multipart ETag
-// and the number of bytes written. wantSize is the expected total; the finished
-// file is checked against it before anything is published.
+// and the stat of the published object. wantSize is the expected total; the
+// finished file is checked against it before anything is published, and
+// precondition (when not nil) is checked against the destination at publication.
 //
 // The scratch file is created in the destination directory, exactly as a plain
 // PutObject does, so publishing is a same-directory rename: atomic (readers see
 // either no object or the complete one) and immune to the destination being a
 // different mount from the staging area. A crash mid-assembly leaves a
 // ".seb-tmp-" file that the janitor's age-bounded sweep collects.
-func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (string, int64, error) {
+func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string, precondition func(os.FileInfo, error) error) (string, os.FileInfo, error) {
 	dir := s.uploadDir(id)
 
 	destDir := filepath.Dir(dest)
 	if err := fileops.Mkdir(s.rootDir, destDir, 0o755, true); err != nil {
-		return "", 0, fmt.Errorf("multipart: create destination dir: %w", err)
+		return "", nil, fmt.Errorf("multipart: create destination dir: %w", err)
 	}
 
 	tmp, err := fileops.CreateTemp(destDir, tempPrefix+"assemble-*")
 	if err != nil {
-		return "", 0, fmt.Errorf("multipart: create assembly temp: %w", err)
+		return "", nil, fmt.Errorf("multipart: create assembly temp: %w", err)
 	}
 	defer fileops.ReleaseTemp(tmp)
 	tmpPath := tmp.Name()
@@ -946,9 +982,9 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 		if err != nil {
 			cleanup()
 			if errors.Is(err, os.ErrNotExist) {
-				return "", 0, ErrInvalidPart
+				return "", nil, ErrInvalidPart
 			}
-			return "", 0, fmt.Errorf("multipart: open part %d: %w", p.Number, err)
+			return "", nil, fmt.Errorf("multipart: open part %d: %w", p.Number, err)
 		}
 
 		verifier := md5.New()
@@ -956,14 +992,14 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 		f.Close()
 		if err != nil {
 			cleanup()
-			return "", 0, fmt.Errorf("multipart: copy part %d: %w", p.Number, err)
+			return "", nil, fmt.Errorf("multipart: copy part %d: %w", p.Number, err)
 		}
 
 		raw := verifier.Sum(nil)
 		if hex.EncodeToString(raw) != p.ETag || n != p.Size {
 			cleanup()
 			s.logger.Error("staged part failed integrity check", "upload_id", id, "part", p.Number)
-			return "", 0, ErrCorruptPart
+			return "", nil, ErrCorruptPart
 		}
 		composite.Write(raw)
 		written += n
@@ -974,30 +1010,31 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string) (
 	// published under the object's name.
 	if written != wantSize {
 		cleanup()
-		return "", 0, fmt.Errorf("multipart: assembled %d bytes, expected %d", written, wantSize)
+		return "", nil, fmt.Errorf("multipart: assembled %d bytes, expected %d", written, wantSize)
 	}
 	if info, err := tmp.Stat(); err == nil && info.Size() != wantSize {
 		cleanup()
-		return "", 0, fmt.Errorf("multipart: assembled file is %d bytes, expected %d", info.Size(), wantSize)
+		return "", nil, fmt.Errorf("multipart: assembled file is %d bytes, expected %d", info.Size(), wantSize)
 	}
 
 	if err := tmp.Sync(); err != nil {
 		cleanup()
-		return "", 0, fmt.Errorf("multipart: sync assembled object: %w", err)
+		return "", nil, fmt.Errorf("multipart: sync assembled object: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpPath)
-		return "", 0, fmt.Errorf("multipart: close assembled object: %w", err)
+		return "", nil, fmt.Errorf("multipart: close assembled object: %w", err)
 	}
 
-	if err := fileops.Publish(s.rootDir, tmpPath, dest); err != nil {
+	info, err := fileops.PublishIf(s.rootDir, tmpPath, dest, precondition)
+	if err != nil {
 		os.Remove(tmpPath)
-		return "", 0, fmt.Errorf("multipart: publish object: %w", err)
+		return "", nil, fmt.Errorf("multipart: publish object: %w", err)
 	}
 	rootDir(destDir)
 
 	etag := fmt.Sprintf("%s-%d", hex.EncodeToString(composite.Sum(nil)), len(parts))
-	return etag, written, nil
+	return etag, info, nil
 }
 
 // etagMatches compares a client-supplied ETag with a staged digest, tolerating the
@@ -1014,8 +1051,13 @@ func etagMatches(clientETag, digest string) bool {
 // Cleanup removes uploads whose last activity is older than the TTL and reports
 // how many were removed. An upload's activity is the newest timestamp among its
 // directory and the files in it, so a long upload that keeps receiving parts is
-// never collected out from under a client.
+// never collected out from under a client. Completion records past the TTL go
+// too; they are not counted.
 func (s *Store) Cleanup(now time.Time) int {
+	if n := s.cleanupCompletions(now); n > 0 {
+		s.logger.Info("expired multipart completion records removed", "count", n)
+	}
+
 	entries, err := os.ReadDir(s.stagingDir)
 	if err != nil {
 		s.logger.Warn("multipart cleanup: read staging dir failed", "error", err)

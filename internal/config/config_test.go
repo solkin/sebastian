@@ -14,6 +14,7 @@ root_dir: /tmp/test
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -53,9 +54,12 @@ gateways:
   http:
     enabled: true
     listen_addr: ":8400"
+    allow_anonymous: true
   sftp:
     enabled: true
     listen_addr: ":8500"
+    username: user
+    password: pass
     host_key_path: /etc/sebastian/host_key
 `)
 	cfg, err := Load(path)
@@ -86,6 +90,7 @@ gateways:
   s3:
     enabled: true
     access_key: file-key
+    secret_key: file-secret
 `)
 	t.Setenv("SEBASTIAN_ROOT_DIR", "/from-env")
 	t.Setenv("SEBASTIAN_S3_ACCESS_KEY", "env-key")
@@ -112,6 +117,7 @@ root_dir: /tmp/test
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
     buckets: [files, backups]
 `)
 	cfg, err := Load(path)
@@ -140,7 +146,9 @@ gateways:
     enabled: false
 `)
 	t.Setenv("SEBASTIAN_S3_ENABLED", "true")
+	t.Setenv("SEBASTIAN_S3_ALLOW_ANONYMOUS", "true")
 	t.Setenv("SEBASTIAN_HTTP_ENABLED", "1")
+	t.Setenv("SEBASTIAN_HTTP_ALLOW_ANONYMOUS", "yes")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -179,13 +187,21 @@ gateways:
 
 func TestSecurityWarnings(t *testing.T) {
 	open := &Config{Gateways: Gateways{
-		S3:     S3Config{Enabled: true},
-		WebDAV: WebDAVConfig{Enabled: true},
-		HTTP:   HTTPConfig{Enabled: true},
-		SFTP:   SFTPConfig{Enabled: true},
+		S3:     S3Config{Enabled: true, AllowAnonymous: true},
+		WebDAV: WebDAVConfig{Enabled: true, AllowAnonymous: true},
+		HTTP:   HTTPConfig{Enabled: true, Username: "u", Password: "p", AllowAnonymous: true},
+		SFTP:   SFTPConfig{Enabled: false, AllowAnonymous: true},
 	}}
-	if got := SecurityWarnings(open); len(got) != 4 {
-		t.Fatalf("expected 4 warnings for open gateways, got %d: %v", len(got), got)
+	got := strings.Join(SecurityWarnings(open), "\n")
+	for _, want := range []string{"gateways.s3 allows anonymous", "gateways.webdav allows anonymous"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+	for _, unwanted := range []string{"gateways.http", "gateways.sftp"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("unexpected warning about %s in %q", unwanted, got)
+		}
 	}
 
 	secured := &Config{Gateways: Gateways{
@@ -199,9 +215,86 @@ func TestSecurityWarnings(t *testing.T) {
 	}
 }
 
+// A gateway that is enabled must authenticate unless an operator explicitly
+// opts out. A missing compose variable, or one credential of a pair, used to
+// open the directory to anonymous writes behind a public reverse proxy.
+func TestGatewayCredentialsFailClosed(t *testing.T) {
+	gateways := []struct{ name, enabled, first, second, anonymous string }{
+		{"s3", "SEBASTIAN_S3_ENABLED", "SEBASTIAN_S3_ACCESS_KEY", "SEBASTIAN_S3_SECRET_KEY", "SEBASTIAN_S3_ALLOW_ANONYMOUS"},
+		{"webdav", "SEBASTIAN_WEBDAV_ENABLED", "SEBASTIAN_WEBDAV_USERNAME", "SEBASTIAN_WEBDAV_PASSWORD", "SEBASTIAN_WEBDAV_ALLOW_ANONYMOUS"},
+		{"http", "SEBASTIAN_HTTP_ENABLED", "SEBASTIAN_HTTP_USERNAME", "SEBASTIAN_HTTP_PASSWORD", "SEBASTIAN_HTTP_ALLOW_ANONYMOUS"},
+		{"sftp", "SEBASTIAN_SFTP_ENABLED", "SEBASTIAN_SFTP_USERNAME", "SEBASTIAN_SFTP_PASSWORD", "SEBASTIAN_SFTP_ALLOW_ANONYMOUS"},
+	}
+	cases := []struct {
+		name, first, second, anonymous, want string
+	}{
+		{name: "both set", first: "user", second: "pass"},
+		{name: "none", want: "allow_anonymous"},
+		{name: "none but explicitly anonymous", anonymous: "true"},
+		{name: "first only", first: "admin", want: "needs both"},
+		{name: "second only", second: "pass", want: "needs both"},
+		{name: "first only even if anonymous", first: "admin", anonymous: "true", want: "needs both"},
+		{name: "example placeholder", first: "admin", second: "changeme-password", want: "placeholder"},
+	}
+	for _, g := range gateways {
+		for _, tc := range cases {
+			t.Run(g.name+"/"+tc.name, func(t *testing.T) {
+				t.Setenv("SEBASTIAN_ROOT_DIR", t.TempDir())
+				t.Setenv("SEBASTIAN_SFTP_HOST_KEY_PATH", "/tmp/host_key")
+				t.Setenv(g.enabled, "true")
+				t.Setenv(g.first, tc.first)
+				t.Setenv(g.second, tc.second)
+				t.Setenv(g.anonymous, tc.anonymous)
+				_, err := Load("")
+				switch {
+				case tc.want == "" && err != nil:
+					t.Fatalf("rejected: %v", err)
+				case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+					t.Fatalf("expected error containing %q, got %v", tc.want, err)
+				}
+			})
+		}
+	}
+}
+
+// A nonempty environment value that does not parse used to be dropped in
+// favour of the default; now it stops startup.
+func TestLoadRejectsInvalidEnvironment(t *testing.T) {
+	for key, value := range map[string]string{
+		"SEBASTIAN_S3_ENABLED":                   "ture",
+		"SEBASTIAN_MAX_UPLOAD_BYTES":             "1GB",
+		"SEBASTIAN_MULTIPART_MAX_ACTIVE_UPLOADS": "many",
+		"SEBASTIAN_MULTIPART_UPLOAD_TTL":         "1 day",
+		"SEBASTIAN_ACCESS_LOG":                   "maybe",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv("SEBASTIAN_HTTP_ENABLED", "true")
+			t.Setenv("SEBASTIAN_HTTP_ALLOW_ANONYMOUS", "true")
+			t.Setenv(key, value)
+			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid %s=%q accepted: %v", key, value, err)
+			}
+		})
+	}
+}
+
+func TestAccessLogSetting(t *testing.T) {
+	t.Setenv("SEBASTIAN_HTTP_ENABLED", "true")
+	t.Setenv("SEBASTIAN_HTTP_ALLOW_ANONYMOUS", "true")
+	cfg, err := Load("")
+	if err != nil || !cfg.AccessLog {
+		t.Fatalf("access log must stay on by default: %v", err)
+	}
+	t.Setenv("SEBASTIAN_ACCESS_LOG", "false")
+	if cfg, err = Load(""); err != nil || cfg.AccessLog {
+		t.Fatalf("access_log=false not applied: %v", err)
+	}
+}
+
 func TestLoad_NoFile(t *testing.T) {
 	t.Setenv("SEBASTIAN_ROOT_DIR", "/tmp/test")
 	t.Setenv("SEBASTIAN_S3_ENABLED", "true")
+	t.Setenv("SEBASTIAN_S3_ALLOW_ANONYMOUS", "true")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -229,25 +322,26 @@ func TestLoad_MissingFile(t *testing.T) {
 
 func TestParseBool(t *testing.T) {
 	tests := []struct {
-		input string
-		want  bool
+		input   string
+		want    bool
+		invalid bool
 	}{
-		{"true", true},
-		{"TRUE", true},
-		{"True", true},
-		{"1", true},
-		{"yes", true},
-		{"YES", true},
-		{"false", false},
-		{"0", false},
-		{"no", false},
-		{"", false},
-		{"anything", false},
+		{input: "true", want: true},
+		{input: "TRUE", want: true},
+		{input: "True", want: true},
+		{input: "1", want: true},
+		{input: "yes", want: true},
+		{input: "YES", want: true},
+		{input: "false"},
+		{input: "0"},
+		{input: "no"},
+		{input: "", invalid: true},
+		{input: "anything", invalid: true},
 	}
 	for _, tt := range tests {
-		got := parseBool(tt.input)
-		if got != tt.want {
-			t.Errorf("parseBool(%q) = %v, want %v", tt.input, got, tt.want)
+		got, err := parseBool(tt.input)
+		if (err != nil) != tt.invalid || got != tt.want {
+			t.Errorf("parseBool(%q) = %v, %v; want %v, invalid %v", tt.input, got, err, tt.want, tt.invalid)
 		}
 	}
 }
@@ -268,6 +362,7 @@ root_dir: /tmp/test
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -298,6 +393,7 @@ multipart:
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -324,6 +420,7 @@ multipart:
 gateways:
   s3:
     enabled: true
+    allow_anonymous: true
 `)
 	t.Setenv("SEBASTIAN_MULTIPART_MAX_PARTS", "77")
 	t.Setenv("SEBASTIAN_MULTIPART_MIN_PART_BYTES", "2048")
@@ -366,7 +463,7 @@ multipart:
 	}
 	for name, fragment := range cases {
 		t.Run(name, func(t *testing.T) {
-			path := writeYAML(t, "root_dir: /tmp/test\ngateways:\n  s3:\n    enabled: true\n"+fragment)
+			path := writeYAML(t, "root_dir: /tmp/test\ngateways:\n  s3:\n    enabled: true\n    allow_anonymous: true\n"+fragment)
 			if _, err := Load(path); err == nil {
 				t.Fatal("expected an error")
 			}

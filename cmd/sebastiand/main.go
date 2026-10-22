@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,9 +26,23 @@ import (
 	"github.com/solkin/sebastian/internal/multipart"
 )
 
+// version is the release this binary was built from.
+var version = "1.7.0"
+
+// shutdownDrain is how long open transfers may finish after a stop signal.
+// It stays below Docker's default 10 s grace period, so a stop with a slow
+// download in flight ends in an orderly exit rather than SIGKILL.
+const shutdownDrain = 8 * time.Second
+
 func main() {
 	configPath := flag.String("config", "", "path to config file (optional, env vars also work)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("sebastiand", version)
+		return
+	}
 
 	logs := logging.NewAsync(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	defer logs.Close()
@@ -73,7 +89,10 @@ func main() {
 	// No upload can be in flight yet, so age is irrelevant here.
 	gateway.SweepTempFiles(cfg.RootDir, 0, logger)
 
+	gateway.SetAccessLog(cfg.AccessLog)
+
 	logger.Info("sebastian starting",
+		"version", version,
 		"root_dir", cfg.RootDir,
 		"s3", cfg.Gateways.S3.Enabled,
 		"webdav", cfg.Gateways.WebDAV.Enabled,
@@ -182,23 +201,42 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	var failure error
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", "signal", sig)
-	case err := <-errCh:
-		logger.Error("gateway error, shutting down", "error", err)
+	case failure = <-errCh:
+		logger.Error("gateway error, shutting down", "error", failure)
 	}
 
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Every gateway drains at once within one budget. One after another they
+	// could each wait out the whole budget, past the point where the container
+	// runtime kills the process.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownDrain)
 	defer shutdownCancel()
-
+	var stopping sync.WaitGroup
 	for _, gw := range gateways {
-		if err := gw.Stop(shutdownCtx); err != nil {
-			logger.Error("gateway stop error", "gateway", gw.Name(), "error", err)
-		}
+		stopping.Add(1)
+		go func() {
+			defer stopping.Done()
+			if err := gw.Stop(shutdownCtx); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("gateway closed transfers still open after the drain period", "gateway", gw.Name(), "drain", shutdownDrain)
+				} else {
+					logger.Error("gateway stop error", "gateway", gw.Name(), "error", err)
+				}
+			}
+		}()
 	}
+	stopping.Wait()
 
 	logger.Info("sebastian stopped")
+	if failure != nil {
+		// A port that could not be bound, or a gateway that failed, must not
+		// look like an orderly stop to a supervisor reading the exit status.
+		logs.Close()
+		os.Exit(1)
+	}
 }

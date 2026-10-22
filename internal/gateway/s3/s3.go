@@ -134,6 +134,10 @@ func (g *Gateway) extractBucketFromHost(host string) string {
 //	Host: mybucket.endpoint / → bucket operations
 //	Host: mybucket.endpoint /{key} → object operations
 func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
+	// Objects are served with the media type of their name (see contentTypeFor);
+	// a browser must not second-guess it into something it would execute.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
 	if !g.authenticate(r) {
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 		return
@@ -172,8 +176,8 @@ func (g *Gateway) route(w http.ResponseWriter, r *http.Request) {
 // routeBucketOrObject handles all bucket-level and object-level operations.
 // Used by both path-style and virtual-hosted-style routing.
 func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if gateway.IsScratchFile(bucket) {
-		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name")
+	if failure := g.bucketFailure(bucket); failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
 		return
 	}
 
@@ -227,11 +231,9 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	for _, segment := range strings.Split(key, "/") {
-		if gateway.IsScratchFile(segment) {
-			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid key")
-			return
-		}
+	if failure := keyFailure(key); failure != nil {
+		writeS3Error(w, failure.status, failure.code, failure.message)
+		return
 	}
 
 	// Multipart operations are selected by query parameters on the object URL:
@@ -245,6 +247,37 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	if _, ok := query["partNumber"]; ok && uploadID == "" {
 		writeS3Error(w, http.StatusBadRequest, "InvalidRequest",
 			"A partNumber requires an uploadId. Start a multipart upload first.")
+		return
+	}
+
+	// A PUT that names a copy source carries no data of its own: it is a
+	// CopyObject, or for a part an UploadPartCopy. Neither may fall through to a
+	// plain upload, which would store its empty body over the destination.
+	if r.Header.Get("X-Amz-Copy-Source") != "" && r.Method == http.MethodPut {
+		if uploadID != "" {
+			g.handleUploadPartCopy(w, r, bucket, key, uploadID)
+			return
+		}
+		g.handleCopyObject(w, r, bucket, key)
+		return
+	}
+
+	// A key ending in "/" is a folder marker, which is the folder itself here.
+	if isFolderKey(key) {
+		if initiating || uploadID != "" {
+			writeObjectFailure(w, errFolderHasNoData)
+			return
+		}
+		switch r.Method {
+		case http.MethodHead, http.MethodGet:
+			g.handleGetFolder(w, r, bucket, key)
+		case http.MethodPut:
+			g.handlePutFolder(w, r, bucket, key)
+		case http.MethodDelete:
+			g.handleDeleteFolder(w, r, bucket, key)
+		default:
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "Method not allowed")
+		}
 		return
 	}
 
@@ -280,6 +313,32 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 	}
 }
 
+// bucketFailure holds a bucket name to the namespace rules: a scratch name is
+// refused. The route checks the bucket of the URL; CopyObject checks its
+// source's too.
+func (g *Gateway) bucketFailure(bucket string) *objectFailure {
+	if gateway.IsScratchFile(bucket) {
+		return &objectFailure{http.StatusBadRequest, "InvalidBucketName", "Invalid bucket name"}
+	}
+	return nil
+}
+
+// keyFailure holds a key to the namespace rules before any operation looks at
+// it: a key no filesystem can hold is refused (see keyShapeFailure), and so is
+// a scratch name. The route checks the key of the URL, and CopyObject the key
+// of its source.
+func keyFailure(key string) *objectFailure {
+	if failure := keyShapeFailure(key); failure != nil {
+		return failure
+	}
+	for _, segment := range strings.Split(key, "/") {
+		if gateway.IsScratchFile(segment) {
+			return &objectFailure{http.StatusBadRequest, "InvalidArgument", "Invalid key"}
+		}
+	}
+	return nil
+}
+
 // authenticate checks the request for valid credentials.
 // If no access_key/secret_key are configured, all requests are allowed.
 // Otherwise the request must carry a valid AWS Signature V4 signature, either in
@@ -288,6 +347,12 @@ func (g *Gateway) routeBucketOrObject(w http.ResponseWriter, r *http.Request, bu
 func (g *Gateway) authenticate(r *http.Request) bool {
 	if g.config.AccessKey == "" && g.config.SecretKey == "" {
 		return true
+	}
+	// Half a key pair admits nobody: an empty secret is a key anyone can sign
+	// with. Configuration validation refuses it; this keeps the gateway closed
+	// regardless.
+	if g.config.AccessKey == "" || g.config.SecretKey == "" {
+		return false
 	}
 
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {

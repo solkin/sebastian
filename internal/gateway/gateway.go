@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/solkin/sebastian/internal/fileops"
@@ -36,8 +38,11 @@ const ReservedDirName = ".sebastian"
 
 // IsReserved reports whether name is the reserved state directory. Gateways call
 // it when filtering the entries of rootDir itself.
+//
+// Every spelling is reserved: on a case-insensitive volume (APFS, NTFS)
+// ".SEBASTIAN" opens the same directory, with the staged parts of uploads.
 func IsReserved(name string) bool {
-	return name == ReservedDirName
+	return strings.EqualFold(name, ReservedDirName)
 }
 
 // IsReservedPath reports whether fullPath is the reserved state directory of
@@ -52,7 +57,7 @@ func IsReservedPath(rootDir, fullPath string) bool {
 	if err != nil {
 		return false
 	}
-	return absPath == filepath.Join(absRoot, ReservedDirName)
+	return filepath.Dir(absPath) == absRoot && IsReserved(filepath.Base(absPath))
 }
 
 // IsClientVisiblePath reports whether a directory entry may be exposed through a
@@ -223,15 +228,42 @@ func SafePath(rootDir, reqPath string) (relPath string, fullPath string, err err
 // root-relative path. SafePath calls it for both the requested path and its
 // symlink-resolved target.
 func validateClientPath(rel string) error {
-	if rel == ReservedDirName || strings.HasPrefix(rel, ReservedDirName+"/") {
+	// No filesystem stores a NUL; refusing it here answers every gateway
+	// with a bad request instead of an error from deep in a syscall.
+	if strings.ContainsRune(rel, 0) {
+		return fmt.Errorf("invalid name")
+	}
+	first, _, _ := strings.Cut(rel, "/")
+	if IsReserved(first) {
 		return fmt.Errorf("reserved path")
 	}
 	for _, seg := range strings.Split(rel, "/") {
-		if IsScratchFile(seg) {
+		if isScratchSpelling(seg) {
 			return fmt.Errorf("reserved path")
 		}
 	}
 	return nil
+}
+
+// ClientVisibleName applies the namespace rules of validateClientPath to one
+// entry of a directory that already passed them, so only the entry's own name
+// can break one. It allocates nothing: a listing calls it per entry. Symlinks
+// still need IsClientVisiblePath.
+func ClientVisibleName(dirRel, name string) bool {
+	if dirRel == "" && IsReserved(name) {
+		return false
+	}
+	return strings.IndexByte(name, 0) < 0 && !isScratchSpelling(name)
+}
+
+// isScratchSpelling is IsScratchFile in any letter case: a client must not
+// reach a scratch file through another spelling of its name.
+func isScratchSpelling(name string) bool {
+	return hasPrefixFold(name, tempFilePrefix) || hasPrefixFold(name, backupFilePrefix)
+}
+
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // resolveNoSymlinkEscape resolves full through its nearest existing ancestor and
@@ -261,9 +293,15 @@ func resolveNoSymlinkEscape(rootDir, full string) (resolvedPath, realRoot string
 
 // CheckBasicAuth validates HTTP Basic Auth credentials.
 // Returns true if no auth is configured (both empty) or credentials match.
+//
+// Half a pair admits nobody: an empty password is not a secret. Configuration
+// validation already refuses that; this keeps the gateway closed regardless.
 func CheckBasicAuth(r *http.Request, username, password string) bool {
 	if username == "" && password == "" {
 		return true
+	}
+	if username == "" || password == "" {
+		return false
 	}
 	user, pass, ok := r.BasicAuth()
 	if !ok {
@@ -274,11 +312,56 @@ func CheckBasicAuth(r *http.Request, username, password string) bool {
 	return userOK&passOK == 1
 }
 
+// IdleTransferTimeout bounds how long a request body or a response may make no
+// progress. A total timeout would cut off a large file on a slow link; none at
+// all let a client that sent one byte, or stopped reading, hold a goroutine, a
+// descriptor and a scratch file forever. Progress, not duration, is bounded.
+var IdleTransferTimeout = 5 * time.Minute
+
+// idleDeadlines moves a connection's deadlines forward while a transfer
+// progresses. Deadlines are refreshed at most every eighth of the timeout, so
+// the per-chunk cost of a large transfer stays a clock read.
+type idleDeadlines struct {
+	rc        *http.ResponseController
+	timeout   time.Duration
+	lastRead  time.Time
+	lastWrite time.Time
+}
+
+func (d *idleDeadlines) extendRead() {
+	if now := time.Now(); now.Sub(d.lastRead) >= d.timeout/8 {
+		d.lastRead = now
+		_ = d.rc.SetReadDeadline(now.Add(d.timeout))
+	}
+}
+
+func (d *idleDeadlines) extendWrite() {
+	if now := time.Now(); now.Sub(d.lastWrite) >= d.timeout/8 {
+		d.lastWrite = now
+		_ = d.rc.SetWriteDeadline(now.Add(d.timeout))
+	}
+}
+
+// idleBody moves the read deadline while the handler reads the body. When the
+// body ends, net/http clears the deadline itself before it starts watching the
+// connection for a disconnect, so a long publish after the upload is not cut off.
+type idleBody struct {
+	io.ReadCloser
+	deadlines *idleDeadlines
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	b.deadlines.extendRead()
+	return b.ReadCloser.Read(p)
+}
+
 // ResponseLogger wraps http.ResponseWriter to capture status code and body size.
 type ResponseLogger struct {
 	http.ResponseWriter
 	Status int
 	Size   int
+
+	deadlines *idleDeadlines
 }
 
 // WriteHeader captures the status code.
@@ -289,22 +372,62 @@ func (r *ResponseLogger) WriteHeader(status int) {
 
 // Write captures the body size.
 func (r *ResponseLogger) Write(b []byte) (int, error) {
+	if r.deadlines != nil {
+		r.deadlines.extendWrite()
+	}
 	n, err := r.ResponseWriter.Write(b)
 	r.Size += n
 	return n, err
 }
 
-// LogMiddleware returns an HTTP handler that logs every request.
+// Flush forwards to the underlying writer when it supports flushing.
+func (r *ResponseLogger) Flush() {
+	if r.deadlines != nil {
+		r.deadlines.extendWrite()
+	}
+	_ = http.NewResponseController(r.ResponseWriter).Flush()
+}
+
+// Unwrap lets http.ResponseController reach the connection beneath.
+func (r *ResponseLogger) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+var accessLog atomic.Bool
+
+func init() { accessLog.Store(true) }
+
+// SetAccessLog turns the per-request log line on or off.
+func SetAccessLog(enabled bool) { accessLog.Store(enabled) }
+
+// LogMiddleware returns an HTTP handler that bounds idle transfers and logs
+// every request unless the access log is off.
 func LogMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rl := &ResponseLogger{ResponseWriter: w, Status: 200}
+		started := time.Now()
+		deadlines := &idleDeadlines{rc: http.NewResponseController(w), timeout: IdleTransferTimeout}
+		// A keep-alive connection may still carry the write deadline of the
+		// previous response. This one sets its own once it starts writing, so
+		// a long publish before the first byte is not cut short.
+		_ = deadlines.rc.SetWriteDeadline(time.Time{})
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &idleBody{ReadCloser: r.Body, deadlines: deadlines}
+		}
+		rl := &ResponseLogger{ResponseWriter: w, Status: 200, deadlines: deadlines}
 		next.ServeHTTP(rl, r)
-		logger.Info("request",
+		if !accessLog.Load() {
+			return
+		}
+		attrs := []any{
 			"method", r.Method,
-			"url", r.URL.String(),
+			"url", requestLogURL(r),
 			"status", rl.Status,
 			"size", rl.Size,
-			"user_agent", r.UserAgent(),
-		)
+			"duration_ms", time.Since(started).Milliseconds(),
+			"remote", r.RemoteAddr,
+		}
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			attrs = append(attrs, "forwarded_for", forwarded)
+		}
+		attrs = append(attrs, "user_agent", r.UserAgent())
+		logger.Info("request", attrs...)
 	})
 }

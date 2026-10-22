@@ -1,29 +1,38 @@
 services:
   sebastian:
-    # Image published by the GH Actions "Docker" workflow (Docker Hub).
-    # Override/pin via SEBASTIAN_IMAGE in .env (e.g. solkin/sebastian:1.2.3).
-    image: ${SEBASTIAN_IMAGE:-solkin/sebastian:latest}
+    # Image published by the GH Actions "Docker" workflow (Docker Hub). Pin a
+    # release; override via SEBASTIAN_IMAGE in .env. ":latest" moves on every
+    # release.
+    image: ${SEBASTIAN_IMAGE:-solkin/sebastian:1.7.0}
     container_name: sebastian
     restart: unless-stopped
+    # After SIGTERM open transfers get 8 s to finish. Docker's default 10 s
+    # leaves almost no margin before SIGKILL.
+    stop_grace_period: 30s
 
     # The container runs as a non-root user, so this UID:GID must own the
     # bind-mounted data directory on the host (see chown step in the README).
     user: "1000:1000"
 
+    # Every variable marked ":?" must be set in .env; compose refuses to start
+    # otherwise. Sebastian itself refuses empty, half-set or example
+    # credentials.
     environment:
       SEBASTIAN_ROOT_DIR: /data/files
+      # One line per request; set false to keep the log quiet.
+      SEBASTIAN_ACCESS_LOG: "${SEBASTIAN_ACCESS_LOG:-true}"
 
       # --- S3 gateway ---
       SEBASTIAN_S3_ENABLED: "true"
       SEBASTIAN_S3_LISTEN_ADDR: ":9200"
-      SEBASTIAN_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
-      SEBASTIAN_S3_SECRET_KEY: "${S3_SECRET_KEY}"
+      SEBASTIAN_S3_ACCESS_KEY: "${S3_ACCESS_KEY:?set S3_ACCESS_KEY}"
+      SEBASTIAN_S3_SECRET_KEY: "${S3_SECRET_KEY:?set S3_SECRET_KEY}"
 
       # --- HTTP UI gateway ---
       SEBASTIAN_HTTP_ENABLED: "true"
       SEBASTIAN_HTTP_LISTEN_ADDR: ":9400"
-      SEBASTIAN_HTTP_USERNAME: "${HTTP_USERNAME}"
-      SEBASTIAN_HTTP_PASSWORD: "${HTTP_PASSWORD}"
+      SEBASTIAN_HTTP_USERNAME: "${HTTP_USERNAME:?set HTTP_USERNAME}"
+      SEBASTIAN_HTTP_PASSWORD: "${HTTP_PASSWORD:?set HTTP_PASSWORD}"
 
       # --- Unused gateways, kept explicitly off ---
       SEBASTIAN_WEBDAV_ENABLED: "false"
@@ -37,6 +46,13 @@ services:
     # nginx reaches this container over the shared network as
     # http://sebastian:9400 (UI) and http://sebastian:9200 (S3). No host ports
     # are published — ingress goes through nginx.
+    logging:
+      # The default json-file driver never rotates the access log.
+      driver: local
+      options:
+        max-size: "100m"
+        max-file: "5"
+
     networks:
       - reverseproxy
 

@@ -535,8 +535,8 @@ func TestUploadMaxBytesLimit(t *testing.T) {
 	w := httptest.NewRecorder()
 	g.server.Handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for over-limit upload, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for over-limit upload, got %d: %s", w.Code, w.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(dir, "large.txt")); !os.IsNotExist(err) {
 		t.Fatal("over-limit upload must not create the file")

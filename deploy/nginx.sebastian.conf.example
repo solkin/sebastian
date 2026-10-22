@@ -1,11 +1,38 @@
-# Example nginx reverse-proxy config for sebastian.
-# Place on the nginx host (which must share the `reverseproxy` Docker network),
-# adapt server_name/certs to your setup, then reload nginx.
+# Example nginx reverse-proxy config for sebastian (nginx 1.27.3 or newer for
+# "resolve" in upstream blocks). Place it on the nginx host, which must share
+# the `reverseproxy` Docker network, adapt server_name/certs, then reload nginx.
 #
 # CRITICAL: `proxy_set_header Host $host;` is required.
 #   - S3 SigV4 signs the Host header; a rewritten Host breaks every signature.
 #   - The HTTP UI's CSRF check compares Origin/Referer against Host.
 # Do NOT set `proxy_set_header Host sebastian:9400;` — that breaks both.
+# $host drops the port. If clients reach nginx on a port other than 443, use
+# `proxy_set_header Host $http_host;`: SigV4 signs the port as well.
+#
+# After the sebastian container is recreated, requests fail for up to the
+# resolver's `valid` time (10 s below) until the new address is resolved.
+#
+# Docker's embedded DNS. Re-resolving keeps nginx working after the sebastian
+# container is recreated with a new address; without it nginx answers 502
+# until it is reloaded.
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+upstream sebastian_s3 {
+    zone sebastian_s3 64k;
+    server sebastian:9200 resolve;
+    # Reuse upstream connections: without keepalive every small request opens
+    # and closes a TCP connection.
+    keepalive 64;
+}
+
+upstream sebastian_ui {
+    zone sebastian_ui 64k;
+    server sebastian:9400 resolve;
+    keepalive 16;
+}
+
+# Optional brake on credential guessing; Sebastian itself does not throttle.
+# limit_req_zone $binary_remote_addr zone=sebastian_auth:10m rate=20r/s;
 
 # ---------- HTTP UI (web file browser) ----------
 server {
@@ -16,12 +43,15 @@ server {
     ssl_certificate     /etc/letsencrypt/live/files.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
 
-    client_max_body_size 0;                        # allow large uploads
-    proxy_request_buffering off;                   # stream, don't buffer to disk
+    client_max_body_size 0;                        # Sebastian enforces max_upload_bytes
+    proxy_request_buffering off;                   # stream uploads, don't spool them
+    proxy_buffering off;                           # stream downloads, don't spool them
 
     location / {
-        proxy_pass         http://sebastian:9400;
+        # limit_req zone=sebastian_auth burst=40 nodelay;
+        proxy_pass         http://sebastian_ui;
         proxy_http_version 1.1;
+        proxy_set_header   Connection "";          # keep upstream connections alive
         proxy_set_header   Host $host;             # REQUIRED (CSRF)
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
@@ -41,12 +71,17 @@ server {
     ssl_certificate     /etc/letsencrypt/live/s3.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/s3.example.com/privkey.pem;
 
-    client_max_body_size 0;
-    proxy_request_buffering off;
+    client_max_body_size 0;                        # Sebastian enforces max_upload_bytes
+    proxy_request_buffering off;                   # stream uploads, don't spool them
+    # With buffering on, a slow client's 500 MiB APK is first written to
+    # nginx's temporary directory: at APK egress rates that is terabytes of
+    # disk writes a day on the proxy.
+    proxy_buffering off;
 
     location / {
-        proxy_pass         http://sebastian:9200;
+        proxy_pass         http://sebastian_s3;
         proxy_http_version 1.1;
+        proxy_set_header   Connection "";          # keep upstream connections alive
         proxy_set_header   Host $host;             # REQUIRED (SigV4)
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;

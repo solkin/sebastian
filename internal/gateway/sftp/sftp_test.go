@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1858,5 +1859,34 @@ func TestOpendirReservedDirDenied(t *testing.T) {
 	}
 	if pktType != sshFxpStatus {
 		t.Fatalf("stat inside the reserved dir was allowed (packet type %d)", pktType)
+	}
+}
+
+// A failure answers without the error text: it named absolute server paths.
+func TestFailureStatusHidesServerPaths(t *testing.T) {
+	syncDir := t.TempDir()
+	os.MkdirAll(filepath.Join(syncDir, "full", "child"), 0o755)
+	addr := testGateway(t, syncDir, "user", "pass")
+	ch := sftpClient(t, addr, "user", "pass")
+	sftpInit(t, ch)
+
+	var req []byte
+	req = marshalUint32(req, 1)
+	req = marshalString(req, "/full")
+	if err := writePacket(ch, sshFxpRmdir, req); err != nil {
+		t.Fatal(err)
+	}
+	pktType, payload, err := readPacket(ch)
+	if err != nil || pktType != sshFxpStatus {
+		t.Fatalf("rmdir of a non-empty directory: %d %v", pktType, err)
+	}
+	_, rest, _ := unmarshalUint32(payload)
+	code, rest, _ := unmarshalUint32(rest)
+	msg, _, _ := unmarshalString(rest)
+	if code == sshFxOk {
+		t.Fatal("removing a non-empty directory succeeded")
+	}
+	if strings.Contains(msg, syncDir) || strings.Contains(msg, "/full") {
+		t.Fatalf("failure message reveals a server path: %q", msg)
 	}
 }

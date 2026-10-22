@@ -456,12 +456,15 @@ func TestStreamingMultipartUploadCompletes(t *testing.T) {
 			w := httptest.NewRecorder()
 			g.route(w, req)
 			var result CompleteMultipartUploadResult
-			if w.Code != http.StatusOK || xml.Unmarshal(w.Body.Bytes(), &result) != nil || result.ETag != compositeETagOf(parts) {
+			if w.Code != http.StatusOK || xml.Unmarshal(w.Body.Bytes(), &result) != nil {
 				t.Fatalf("complete: status %d: %s", w.Code, w.Body.String())
 			}
 			got, err := os.ReadFile(filepath.Join(root, "bucket", "big.apk"))
 			if err != nil || !bytes.Equal(got, bytes.Join(parts, nil)) {
 				t.Fatalf("assembled %d bytes, %v", len(got), err)
+			}
+			if info, err := os.Stat(filepath.Join(root, "bucket", "big.apk")); err != nil || result.ETag != etagFor(info) {
+				t.Fatalf("complete etag %s is not the object's", result.ETag)
 			}
 		})
 	}

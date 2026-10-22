@@ -251,12 +251,19 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
-	if _, err := io.Copy(tmpFile, r.Body); err != nil {
+	body := &readFailure{Reader: r.Body}
+	if _, err := io.Copy(tmpFile, body); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if body.err != nil {
+			// The client stopped sending; nothing was published.
+			g.logger.Info("put aborted by client", "path", relName, "error", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
 		g.logger.Error("put write failed", "path", relName, "error", err)
@@ -828,4 +835,19 @@ func (c *copier) copyDir(src, dst string) error {
 // stageReplace is also used by the replacement fault-injection tests.
 func stageReplace(dst string, op func(string) error) error {
 	return fileops.CopyReplaceLocked(filepath.Dir(dst), dst, op)
+}
+
+// readFailure remembers an error from the request body, which separates a
+// client that went away from a disk that failed during the same copy.
+type readFailure struct {
+	io.Reader
+	err error
+}
+
+func (r *readFailure) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
 }

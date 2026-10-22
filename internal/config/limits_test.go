@@ -23,6 +23,7 @@ func TestUploadLimitContract(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("SEBASTIAN_S3_ENABLED", "true")
+			t.Setenv("SEBASTIAN_S3_ALLOW_ANONYMOUS", "true")
 			t.Setenv("SEBASTIAN_MULTIPART_MAX_ACTIVE_UPLOADS", tc.activeEnv)
 			t.Setenv("SEBASTIAN_MAX_UPLOAD_BYTES", tc.uploadEnv)
 			cfg, err := Load(writeYAML(t, tc.yaml))

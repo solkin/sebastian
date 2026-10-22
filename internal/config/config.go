@@ -15,6 +15,9 @@ import (
 // Config is the top-level configuration.
 type Config struct {
 	RootDir string `yaml:"root_dir"`
+	// AccessLog writes one line per request at info level. At a thousand
+	// requests a second that is tens of gigabytes a day.
+	AccessLog bool `yaml:"access_log"`
 	// MaxUploadBytes caps the size of a single uploaded object/file across the S3,
 	// WebDAV, SFTP, and HTTP UI gateways. 0 means unlimited.
 	MaxUploadBytes int64           `yaml:"max_upload_bytes"`
@@ -61,7 +64,10 @@ type S3Config struct {
 	ListenAddr string `yaml:"listen_addr"`
 	AccessKey  string `yaml:"access_key"`
 	SecretKey  string `yaml:"secret_key"`
-	Domain     string `yaml:"domain"`
+	// AllowAnonymous is the only way to serve the gateway without
+	// credentials; see checkCredentials.
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	Domain         string `yaml:"domain"`
 	// Buckets are created at startup when missing, so that they exist before a
 	// client that cannot create them, or should not, first asks for them.
 	Buckets []string `yaml:"buckets"`
@@ -69,34 +75,37 @@ type S3Config struct {
 
 // WebDAVConfig holds WebDAV gateway settings.
 type WebDAVConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
 }
 
 // HTTPConfig holds HTTP UI gateway settings.
 type HTTPConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
 }
 
 // SFTPConfig holds SFTP gateway settings.
 type SFTPConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	ListenAddr  string `yaml:"listen_addr"`
-	Username    string `yaml:"username"`
-	Password    string `yaml:"password"`
-	HostKeyPath string `yaml:"host_key_path"`
+	Enabled        bool   `yaml:"enabled"`
+	ListenAddr     string `yaml:"listen_addr"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	HostKeyPath    string `yaml:"host_key_path"`
 }
 
 // Load reads configuration from a YAML file, applies environment variable
 // overrides, and sets defaults.
 func Load(path string) (*Config, error) {
 	// Seed this default before YAML parsing: an explicit zero means unlimited.
-	cfg := &Config{Multipart: MultipartConfig{MaxActiveUploads: 10000}}
+	cfg := &Config{AccessLog: true, Multipart: MultipartConfig{MaxActiveUploads: 10000}}
 
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -109,7 +118,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyDefaults(cfg)
-	applyEnv(cfg)
+	if err := applyEnv(cfg); err != nil {
+		return nil, fmt.Errorf("environment: %w", err)
+	}
 
 	if err := validate(cfg); err != nil {
 		return nil, err
@@ -138,7 +149,10 @@ func applyDefaults(cfg *Config) {
 	// Other unset multipart fields are resolved by the multipart store.
 }
 
-func applyEnv(cfg *Config) {
+// applyEnv overrides settings with environment variables. A nonempty value
+// that does not parse stops startup: falling back silently to a default left an
+// operator running with a limit, a gateway or a duration nobody asked for.
+func applyEnv(cfg *Config) error {
 	envMap := map[string]*string{
 		"SEBASTIAN_ROOT_DIR":           &cfg.RootDir,
 		"SEBASTIAN_S3_LISTEN_ADDR":     &cfg.Gateways.S3.ListenAddr,
@@ -167,32 +181,38 @@ func applyEnv(cfg *Config) {
 	}
 
 	envBoolMap := map[string]*bool{
-		"SEBASTIAN_S3_ENABLED":     &cfg.Gateways.S3.Enabled,
-		"SEBASTIAN_WEBDAV_ENABLED": &cfg.Gateways.WebDAV.Enabled,
-		"SEBASTIAN_HTTP_ENABLED":   &cfg.Gateways.HTTP.Enabled,
-		"SEBASTIAN_SFTP_ENABLED":   &cfg.Gateways.SFTP.Enabled,
+		"SEBASTIAN_ACCESS_LOG":             &cfg.AccessLog,
+		"SEBASTIAN_S3_ENABLED":             &cfg.Gateways.S3.Enabled,
+		"SEBASTIAN_S3_ALLOW_ANONYMOUS":     &cfg.Gateways.S3.AllowAnonymous,
+		"SEBASTIAN_WEBDAV_ENABLED":         &cfg.Gateways.WebDAV.Enabled,
+		"SEBASTIAN_WEBDAV_ALLOW_ANONYMOUS": &cfg.Gateways.WebDAV.AllowAnonymous,
+		"SEBASTIAN_HTTP_ENABLED":           &cfg.Gateways.HTTP.Enabled,
+		"SEBASTIAN_HTTP_ALLOW_ANONYMOUS":   &cfg.Gateways.HTTP.AllowAnonymous,
+		"SEBASTIAN_SFTP_ENABLED":           &cfg.Gateways.SFTP.Enabled,
+		"SEBASTIAN_SFTP_ALLOW_ANONYMOUS":   &cfg.Gateways.SFTP.AllowAnonymous,
 	}
 	for env, ptr := range envBoolMap {
 		if v := os.Getenv(env); v != "" {
-			*ptr = parseBool(v)
-		}
-	}
-
-	if v := os.Getenv("SEBASTIAN_MAX_UPLOAD_BYTES"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-			cfg.MaxUploadBytes = n
+			b, err := parseBool(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", env, err)
+			}
+			*ptr = b
 		}
 	}
 
 	envInt64Map := map[string]*int64{
+		"SEBASTIAN_MAX_UPLOAD_BYTES":         &cfg.MaxUploadBytes,
 		"SEBASTIAN_MULTIPART_MIN_PART_BYTES": &cfg.Multipart.MinPartBytes,
 		"SEBASTIAN_MULTIPART_MAX_PART_BYTES": &cfg.Multipart.MaxPartBytes,
 	}
 	for env, ptr := range envInt64Map {
 		if v := os.Getenv(env); v != "" {
-			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
-				*ptr = n
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", env, err)
 			}
+			*ptr = n
 		}
 	}
 
@@ -203,9 +223,11 @@ func applyEnv(cfg *Config) {
 	}
 	for env, ptr := range envIntMap {
 		if v := os.Getenv(env); v != "" {
-			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-				*ptr = n
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				return fmt.Errorf("%s: %w", env, err)
 			}
+			*ptr = n
 		}
 	}
 
@@ -216,11 +238,14 @@ func applyEnv(cfg *Config) {
 	}
 	for env, ptr := range envDurationMap {
 		if v := os.Getenv(env); v != "" {
-			if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil && d > 0 {
-				*ptr = d
+			d, err := time.ParseDuration(strings.TrimSpace(v))
+			if err != nil {
+				return fmt.Errorf("%s: %w", env, err)
 			}
+			*ptr = d
 		}
 	}
+	return nil
 }
 
 // splitList reads a comma-separated list, dropping blanks around and between
@@ -235,9 +260,15 @@ func splitList(s string) []string {
 	return items
 }
 
-func parseBool(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return s == "true" || s == "1" || s == "yes"
+func parseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("must be true/false, yes/no, or 1/0")
+	}
 }
 
 func validate(cfg *Config) error {
@@ -254,6 +285,9 @@ func validate(cfg *Config) error {
 
 	if cfg.Gateways.SFTP.Enabled && cfg.Gateways.SFTP.HostKeyPath == "" {
 		return fmt.Errorf("sftp.host_key_path is required when SFTP gateway is enabled")
+	}
+	if err := checkCredentials(cfg); err != nil {
+		return err
 	}
 
 	if cfg.MaxUploadBytes < 0 {
@@ -282,25 +316,60 @@ func validate(cfg *Config) error {
 	return nil
 }
 
-// SecurityWarnings returns messages for enabled gateways that run without any
-// credentials configured. Such gateways accept unauthenticated access (the
-// documented open mode), which is easy to enable by accident — e.g. a default
-// container run — so the operator is warned at startup rather than silently
-// exposing the filesystem.
+// credentialPair is one gateway's authentication settings, named for errors.
+type credentialPair struct {
+	gateway, first, second string
+	a, b                   string
+	enabled, anonymous     bool
+}
+
+func credentialPairs(cfg *Config) []credentialPair {
+	g := cfg.Gateways
+	return []credentialPair{
+		{"gateways.s3", "access_key", "secret_key", g.S3.AccessKey, g.S3.SecretKey, g.S3.Enabled, g.S3.AllowAnonymous},
+		{"gateways.webdav", "username", "password", g.WebDAV.Username, g.WebDAV.Password, g.WebDAV.Enabled, g.WebDAV.AllowAnonymous},
+		{"gateways.http", "username", "password", g.HTTP.Username, g.HTTP.Password, g.HTTP.Enabled, g.HTTP.AllowAnonymous},
+		{"gateways.sftp", "username", "password", g.SFTP.Username, g.SFTP.Password, g.SFTP.Enabled, g.SFTP.AllowAnonymous},
+	}
+}
+
+// checkCredentials fails closed. An enabled gateway needs both credentials,
+// unless it explicitly allows anonymous access with neither. A missing
+// environment variable used to open the whole directory for anonymous writes,
+// and one credential alone was worse than none: an empty secret key or
+// password is a value anyone can sign or log in with.
+func checkCredentials(cfg *Config) error {
+	for _, p := range credentialPairs(cfg) {
+		if !p.enabled {
+			continue
+		}
+		switch {
+		case p.a == "" && p.b == "" && !p.anonymous:
+			return fmt.Errorf("%s is enabled without %s/%s; set both, or set %s.allow_anonymous: true to serve without authentication", p.gateway, p.first, p.second, p.gateway)
+		case (p.a == "") != (p.b == ""):
+			return fmt.Errorf("%s needs both %s and %s; one alone lets anyone in with an empty value", p.gateway, p.first, p.second)
+		case isPlaceholder(p.a) || isPlaceholder(p.b):
+			return fmt.Errorf("%s credentials still contain an example placeholder (changeme); set real values", p.gateway)
+		}
+	}
+	return nil
+}
+
+// isPlaceholder recognizes the example values shipped in .env.example, which
+// are public and therefore not credentials.
+func isPlaceholder(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "changeme")
+}
+
+// SecurityWarnings returns messages for gateways an operator explicitly opened
+// to anonymous access: allowed, but anyone who reaches them can read, write
+// and delete.
 func SecurityWarnings(cfg *Config) []string {
 	var warnings []string
-	g := cfg.Gateways
-	if g.S3.Enabled && g.S3.AccessKey == "" && g.S3.SecretKey == "" {
-		warnings = append(warnings, "S3 gateway is enabled without access_key/secret_key; it accepts unauthenticated requests")
-	}
-	if g.WebDAV.Enabled && g.WebDAV.Username == "" && g.WebDAV.Password == "" {
-		warnings = append(warnings, "WebDAV gateway is enabled without username/password; it accepts unauthenticated requests")
-	}
-	if g.HTTP.Enabled && g.HTTP.Username == "" && g.HTTP.Password == "" {
-		warnings = append(warnings, "HTTP UI gateway is enabled without username/password; it accepts unauthenticated requests")
-	}
-	if g.SFTP.Enabled && g.SFTP.Username == "" && g.SFTP.Password == "" {
-		warnings = append(warnings, "SFTP gateway is enabled without username/password; it accepts unauthenticated connections")
+	for _, p := range credentialPairs(cfg) {
+		if p.enabled && p.anonymous && p.a == "" && p.b == "" {
+			warnings = append(warnings, p.gateway+" allows anonymous access; anyone who reaches it can read, write and delete")
+		}
 	}
 	return warnings
 }

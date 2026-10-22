@@ -146,13 +146,22 @@ func TestCompleteAssemblesObject(t *testing.T) {
 		t.Fatalf("object content mismatch: got %q, want %q", got, want)
 	}
 
-	// The staging directory is gone, and a second completion is rejected exactly
-	// as S3 rejects it.
+	// The staging directory is gone. A retry of the same completion gets its
+	// result again; any other completion is rejected exactly as S3 rejects one
+	// for an upload that is gone.
 	if _, err := s.Get(up.ID); !errors.Is(err, ErrNoSuchUpload) {
 		t.Fatalf("upload still present after complete: %v", err)
 	}
-	if _, err := s.Complete(up.ID, list, dest); !errors.Is(err, ErrNoSuchUpload) {
-		t.Fatalf("second complete error = %v, want ErrNoSuchUpload", err)
+	again, err := s.Complete(up.ID, list, dest)
+	if err != nil || !again.Repeated || again.ETag != res.ETag || again.Size != res.Size ||
+		again.Info.ModTime() != res.Info.ModTime() || again.Bucket != "bucket" || again.Key != "big.bin" {
+		t.Fatalf("repeated complete = %+v, %v; first %+v", again, err, res)
+	}
+	if _, err := s.Complete(up.ID, list[:2], dest); !errors.Is(err, ErrNoSuchUpload) {
+		t.Fatalf("complete with another part list error = %v, want ErrNoSuchUpload", err)
+	}
+	if _, err := s.Complete(up.ID, list, filepath.Join(root, "bucket", "other.bin")); !errors.Is(err, ErrNoSuchUpload) {
+		t.Fatalf("complete into another object error = %v, want ErrNoSuchUpload", err)
 	}
 }
 
