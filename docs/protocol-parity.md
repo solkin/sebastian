@@ -31,7 +31,7 @@ listed explicitly below.
 | Upload limits | Omitted active-upload cap is 10,000; explicit YAML/environment zero is unlimited. Environment overrides YAML. Negative YAML limits are rejected. | `TestUploadLimitContract` |
 | SFTP directory paging | Hidden batches do not produce premature EOF or empty NAME replies. Requests read bounded batches until visible entries or actual EOF. | `TestReaddirHiddenEntriesAndPaging` |
 | WebDAV | COPY/MOVE, overwrite conditions, recursive copies, byte limits, and lock enforcement share behavior. Locks are in memory and apply to that WebDAV gateway. | WebDAV compatibility and lock tests |
-| Authentication | S3 uses SigV4; WebDAV/HTTP use Basic Auth; SFTP uses SSH. Empty credential pairs select open access; partial credentials do not disable authentication. | Gateway authentication tests |
+| Authentication | S3 uses SigV4; WebDAV/HTTP use Basic Auth; SFTP uses SSH. Enabled gateways fail closed unless complete non-example credentials are set or `allow_anonymous` is explicitly enabled; partial credentials are rejected. | Gateway authentication tests |
 
 `max_upload_bytes: 0` is unlimited for S3/WebDAV/SFTP. The HTTP browser keeps its
 1 GiB default request cap. Recursive WebDAV COPY skips symlinks found inside the
@@ -63,8 +63,9 @@ object arrives at a peer, and `TestDeleteObjectsReplicatesEveryDeletion` that
 every deletion of a batch reaches a peer. These node-specific tests belong only
 to Birak.
 
-An explicitly supplied configuration file must exist in both daemons. Birak
-also rejects malformed numeric, duration, and boolean environment overrides.
+An explicitly supplied configuration file must exist in both daemons. Both
+reject unknown YAML fields and malformed numeric, duration, and boolean
+environment overrides.
 
 Both daemons hold a process lease on their data volume. Unmapped recovery backups
 or conflicting offline edits stop startup and preserve the files for explicit

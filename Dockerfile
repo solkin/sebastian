@@ -1,21 +1,29 @@
-FROM golang:1.26.10-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS builder
 
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o sebastiand ./cmd/sebastiand
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION
+# Keep symbol tables so govulncheck can inspect the release binary.
+RUN if [ -n "$VERSION" ]; then \
+      CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-X main.version=${VERSION#v}" -o sebastiand ./cmd/sebastiand; \
+    else \
+      CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o sebastiand ./cmd/sebastiand; \
+    fi
 
 FROM alpine:3.21
 
 # Upgrade the base packages at build time, so a release carries the security
 # fixes published since the base image tag was cut.
-RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata
 COPY --from=builder /build/sebastiand /usr/local/bin/sebastiand
 COPY scripts/find-aws-chunked.sh /usr/local/bin/find-aws-chunked
 
-# Run as a non-root user that owns the data directory.
-RUN addgroup -S sebastian && adduser -S -G sebastian sebastian \
+# Run as a non-root user with explicit UID/GID 1000 matching docker-compose.yml.
+RUN addgroup -g 1000 sebastian && adduser -D -u 1000 -G sebastian sebastian \
     && mkdir -p /data/files \
     && chown -R sebastian:sebastian /data
 
