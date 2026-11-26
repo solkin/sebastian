@@ -396,12 +396,18 @@ func (g *Gateway) handleDeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	entries, err := os.ReadDir(bp)
+	dirFile, err := os.Open(bp)
 	if err != nil {
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
 		return
 	}
-	if len(entries) > 0 {
+	names, readErr := dirFile.Readdirnames(1)
+	dirFile.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Internal error")
+		return
+	}
+	if len(names) > 0 {
 		writeS3Error(w, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
 		return
 	}
@@ -964,7 +970,9 @@ func (g *Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		writers = append(writers, md5Hasher)
 	}
 	size, err := io.Copy(io.MultiWriter(writers...), tracked)
-	tmpFile.Close()
+	if closeErr := tmpFile.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		os.Remove(tmpPath)
 		var maxErr *http.MaxBytesError

@@ -271,7 +271,12 @@ func (g *Gateway) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		g.logger.Error("put close failed", "path", relName, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 
 	if err := fileops.Publish(g.rootDir, tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath)
@@ -510,23 +515,49 @@ func (g *Gateway) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build the copy outside the root lock so large trees do not block
+	// concurrent writes; retain the stage directory against the temp janitor.
+	stage, err := os.MkdirTemp(filepath.Dir(dstFull), ".seb-tmp-replace-*")
+	if err != nil {
+		g.logger.Error("copy stage failed", "from", srcRel, "to", dstRel, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	fileops.RetainTemp(stage)
+	defer fileops.ReleaseTempPath(stage)
+
 	cp := &copier{limit: g.config.MaxUploadBytes, rootDir: g.rootDir}
+	payload := filepath.Join(stage, "payload")
+	var stageErr error
+	if srcInfo.IsDir() {
+		stageErr = cp.copyDir(srcFull, payload)
+	} else {
+		stageErr = cp.copyFile(srcFull, payload)
+	}
+	if stageErr != nil {
+		_ = os.RemoveAll(stage)
+		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", stageErr)
+		status := replacementErrorStatus(stageErr)
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	handedOff := false
 	copyErr := fileops.Do(g.rootDir, func() error {
 		exists, err := checkReplacementLocked(srcFull, dstFull, overwrite)
 		if err != nil {
 			return err
 		}
 		dstExists = exists
-		if err := fileops.CopyReplaceLocked(g.rootDir, dstFull, func(stage string) error {
-			if srcInfo.IsDir() {
-				return cp.copyDir(srcFull, stage)
-			}
-			return cp.copyFile(srcFull, stage)
-		}); err != nil {
+		handedOff = true
+		if err := fileops.ReplaceStagedLocked(g.rootDir, stage, dstFull); err != nil {
 			return err
 		}
 		return fileops.SyncParents(filepath.Dir(dstFull), g.rootDir)
 	})
+	if !handedOff {
+		_ = os.RemoveAll(stage)
+	}
 	if copyErr != nil {
 		g.logger.Error("copy failed", "from", srcRel, "to", dstRel, "error", copyErr)
 		status := replacementErrorStatus(copyErr)
@@ -742,22 +773,21 @@ type copier struct {
 
 // copyFile copies a single file using a temp file + atomic rename.
 func (c *copier) copyFile(src, dst string) error {
-	si, err := os.Stat(src)
+	sf, err := fileops.OpenRegular(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	si, err := sf.Stat()
 	if err != nil {
 		return err
 	}
 	if !si.Mode().IsRegular() {
 		return fmt.Errorf("COPY source is not a regular file: %s", src)
 	}
-	if c.limit > 0 && c.copied+si.Size() > c.limit {
+	if c.limit > 0 && si.Size() > c.limit-c.copied {
 		return errUploadTooLarge
 	}
-
-	sf, err := fileops.OpenRegular(src)
-	if err != nil {
-		return err
-	}
-	defer sf.Close()
 
 	dir := filepath.Dir(dst)
 	tmpFile, err := fileops.CreateTemp(dir, ".seb-tmp-*")
@@ -767,10 +797,20 @@ func (c *copier) copyFile(src, dst string) error {
 	defer fileops.ReleaseTemp(tmpFile)
 	tmpPath := tmpFile.Name()
 
-	if _, err := io.Copy(tmpFile, sf); err != nil {
+	var reader io.Reader = sf
+	if c.limit > 0 {
+		reader = io.LimitReader(sf, c.limit-c.copied+1)
+	}
+	n, err := io.Copy(tmpFile, reader)
+	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
 		return err
+	}
+	if c.limit > 0 && n > c.limit-c.copied {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return errUploadTooLarge
 	}
 	if err := os.Chtimes(tmpPath, si.ModTime(), si.ModTime()); err != nil {
 		tmpFile.Close()
@@ -789,7 +829,7 @@ func (c *copier) copyFile(src, dst string) error {
 	if err := fileops.SyncDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
-	c.copied += si.Size()
+	c.copied += n
 	return nil
 }
 

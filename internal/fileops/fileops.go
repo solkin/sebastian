@@ -7,47 +7,54 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
-var roots sync.Map
-var rootsMu sync.Mutex // binds alternate names to one stable mutex
+type rootState struct {
+	mu            sync.Mutex
+	recoveryClean atomic.Bool
+}
 
-func root(dir string) *sync.Mutex {
+var roots sync.Map
+var rootsMu sync.Mutex // binds alternate names to one stable state
+
+func root(dir string) *rootState {
 	abs, _ := filepath.Abs(dir)
 	if v, ok := roots.Load(abs); ok {
-		return v.(*sync.Mutex)
+		return v.(*rootState)
 	}
 	rootsMu.Lock()
 	defer rootsMu.Unlock()
 	if v, ok := roots.Load(abs); ok {
-		return v.(*sync.Mutex)
+		return v.(*rootState)
 	}
 	real := canonical(abs)
 	v, ok := roots.Load(real)
 	if !ok {
-		v = new(sync.Mutex)
+		v = new(rootState)
 		roots.Store(real, v)
 	}
 	// Keep an established spelling bound even if a symlink/mount is replaced.
 	roots.Store(abs, v)
-	return v.(*sync.Mutex)
+	return v.(*rootState)
 }
 
 // Lock serializes mutations through alternate spellings of the same root.
 // Callers must not acquire it recursively.
 func Lock(dir string) func() {
-	mutex := root(dir)
-	mutex.Lock()
-	return mutex.Unlock
+	r := root(dir)
+	r.mu.Lock()
+	return r.mu.Unlock
 }
 
 // Do completes pending recovery before allowing another mutation.
 func Do(dir string, fn func() error) error {
 	unlock := Lock(dir)
 	defer unlock()
-	if err := RecoverLocked(dir); err != nil {
+	if err := RecoverIfNeededLocked(dir); err != nil {
 		return err
 	}
 	return fn()
@@ -146,6 +153,10 @@ func SyncParents(dir, boundary string) error {
 	current, err := filepath.Abs(canonical(dir))
 	if err != nil {
 		return err
+	}
+	rel, err := filepath.Rel(base, current)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("directory is outside sync root")
 	}
 	for {
 		if err := SyncDir(current); err != nil {

@@ -27,37 +27,60 @@ type replacement struct {
 
 // ReplaceLocked moves src over dst. Both this function and CopyReplaceLocked
 // require the namespace lock. Only fully built objects enter the rename journal.
-func ReplaceLocked(root, src, dst string) error {
-	return replaceLocked(root, src, dst, nil, func(string) {})
+func ReplaceLocked(rootDir, src, dst string) error {
+	return replaceWithStageLocked(rootDir, src, dst, "", nil, func(string) {})
 }
 
 // CopyReplaceLocked builds an unpublished copy before touching the destination.
 // copy must write and sync the supplied staging path, which does not yet exist.
-func CopyReplaceLocked(root, dst string, copy func(string) error) error {
-	return replaceLocked(root, "", dst, copy, func(string) {})
+func CopyReplaceLocked(rootDir, dst string, copy func(string) error) error {
+	return replaceWithStageLocked(rootDir, "", dst, "", copy, func(string) {})
 }
 
-func replaceLocked(root, src, dst string, copy func(string) error, checkpoint func(string)) error {
+// ReplaceStagedLocked publishes a pre-built COPY staging directory (whose
+// content lives at filepath.Join(stage, "payload")) over dst under the lock.
+func ReplaceStagedLocked(rootDir, stage, dst string) error {
+	return replaceWithStageLocked(rootDir, filepath.Join(stage, "payload"), dst, stage, nil, func(string) {})
+}
+
+func replaceLocked(rootDir, src, dst string, copy func(string) error, checkpoint func(string)) error {
+	return replaceWithStageLocked(rootDir, src, dst, "", copy, checkpoint)
+}
+
+func replaceWithStageLocked(rootDir, src, dst, stagedDir string, copy func(string) error, checkpoint func(string)) error {
 	var err error
-	root, err = filepath.Abs(root)
+	state := replacement{Format: 1}
+	// Until the journal is durable, the COPY stage contains only disposable copies.
+	journalWritten := false
+	defer func() {
+		if !journalWritten && stagedDir != "" {
+			_ = os.RemoveAll(stagedDir)
+		}
+	}()
+	absRoot, err := filepath.Abs(rootDir)
 	if err != nil {
 		return err
 	}
-	root, err = filepath.EvalSymlinks(root)
+	absRoot, err = filepath.EvalSymlinks(absRoot)
 	if err != nil {
 		return err
 	}
-	dst, err = replacementName(root, dst)
+	dst, err = replacementName(absRoot, dst)
 	if err != nil {
 		return err
 	}
-	r, err := os.OpenRoot(root)
+	r, err := os.OpenRoot(absRoot)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	state := replacement{Format: 1, Destination: dst}
-	journalDir := filepath.Join(root, ".sebastian", "transactions")
+	defer func() {
+		if !journalWritten && state.CopyStage != "" {
+			_ = r.RemoveAll(state.CopyStage)
+		}
+	}()
+	state.Destination = dst
+	journalDir := filepath.Join(absRoot, ".sebastian", "transactions")
 	if err = safeReplacementParents(r, filepath.Join(".sebastian", "transactions", "journal")); err != nil {
 		return err
 	}
@@ -65,27 +88,26 @@ func replaceLocked(root, src, dst string, copy func(string) error, checkpoint fu
 		return err
 	}
 	if copy != nil {
-		stage, err := os.MkdirTemp(filepath.Join(root, filepath.Dir(dst)), ".seb-tmp-replace-*")
+		stage, err := os.MkdirTemp(filepath.Join(absRoot, filepath.Dir(dst)), ".seb-tmp-replace-*")
 		if err != nil {
 			return err
 		}
-		state.CopyStage, _ = filepath.Rel(root, stage)
+		state.CopyStage, _ = filepath.Rel(absRoot, stage)
 		src = filepath.Join(stage, "payload")
 		if err = copy(src); err != nil {
 			return errors.Join(err, os.RemoveAll(stage), SyncDir(filepath.Dir(stage)))
 		}
 		checkpoint("built")
+	} else if stagedDir != "" {
+		stageRel, err := replacementName(absRoot, stagedDir)
+		if err != nil {
+			return err
+		}
+		state.CopyStage = stageRel
 	} else if src == "" {
 		return fmt.Errorf("missing replacement source")
 	}
-	// Until the journal is durable, the COPY stage contains only disposable copies.
-	journalWritten := false
-	defer func() {
-		if !journalWritten && state.CopyStage != "" {
-			_ = r.RemoveAll(state.CopyStage)
-		}
-	}()
-	if state.Source, err = replacementName(root, src); err != nil {
+	if state.Source, err = replacementName(absRoot, src); err != nil {
 		return err
 	}
 	if err = safeReplacementParents(r, state.Source); err != nil {
@@ -115,7 +137,9 @@ func replaceLocked(root, src, dst string, copy func(string) error, checkpoint fu
 		return err
 	}
 	journal := filepath.Join(journalDir, "replace-"+id+".json")
-	// A failed directory fsync may still leave a valid journal: retain its stage.
+	// A failed directory fsync may still leave a valid journal: retain its stage
+	// and mark recovery pending until RecoverLocked confirms cleanup.
+	root(rootDir).recoveryClean.Store(false)
 	journalWritten = true
 	if err = writeReplacement(journal, state); err != nil {
 		return err
@@ -126,7 +150,7 @@ func replaceLocked(root, src, dst string, copy func(string) error, checkpoint fu
 		if err = r.Rename(dst, state.Backup); err != nil {
 			return rollback(err)
 		}
-		if err = SyncDir(filepath.Join(root, filepath.Dir(dst))); err != nil {
+		if err = SyncDir(filepath.Join(absRoot, filepath.Dir(dst))); err != nil {
 			return rollback(err)
 		}
 	}
@@ -134,7 +158,7 @@ func replaceLocked(root, src, dst string, copy func(string) error, checkpoint fu
 	if err = r.Rename(state.Source, dst); err != nil {
 		return rollback(err)
 	}
-	if err = syncReplacementParents(root, state); err != nil {
+	if err = syncReplacementParents(absRoot, state); err != nil {
 		return rollback(err)
 	}
 	checkpoint("published")
@@ -389,7 +413,23 @@ func validateReplacement(s replacement) error {
 
 // RecoverLocked runs before accepting mutations. A second process
 // termination during rollback or partial cleanup is safely retried.
-func RecoverLocked(root string) error { return recoverLocked(root, func(string) {}) }
+func RecoverLocked(rootDir string) error {
+	if err := recoverLocked(rootDir, func(string) {}); err != nil {
+		return err
+	}
+	root(rootDir).recoveryClean.Store(true)
+	return nil
+}
+
+// RecoverIfNeededLocked skips scanning .sebastian/transactions once
+// RecoverLocked has confirmed no pending replacement journals exist and no new
+// journal has been written since.
+func RecoverIfNeededLocked(rootDir string) error {
+	if root(rootDir).recoveryClean.Load() {
+		return nil
+	}
+	return RecoverLocked(rootDir)
+}
 func recoverLocked(root string, checkpoint func(string)) error {
 	root, err := filepath.Abs(root)
 	if err != nil {

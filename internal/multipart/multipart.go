@@ -222,6 +222,12 @@ type Store struct {
 	mu    sync.Mutex
 	locks map[string]*uploadLock
 
+	// partMu guards partDigests, caching staged part digests per upload so
+	// publishing a part removes any superseded digest in O(1) without rescanning
+	// the upload directory on every part.
+	partMu      sync.Mutex
+	partDigests map[string]map[int][]string
+
 	// sem bounds in-flight part uploads; nil when unlimited.
 	sem chan struct{}
 }
@@ -250,6 +256,7 @@ func New(rootDir string, limits Limits, logger *slog.Logger) (*Store, error) {
 		logger:        logger.With("component", "multipart"),
 		syncDirectory: fileops.SyncDir,
 		locks:         make(map[string]*uploadLock),
+		partDigests:   make(map[string]map[int][]string),
 	}
 	if limits.MaxConcurrentParts > 0 {
 		s.sem = make(chan struct{}, limits.MaxConcurrentParts)
@@ -480,6 +487,10 @@ func (s *Store) Create(bucket, key string) (Upload, error) {
 		return Upload{}, fmt.Errorf("multipart: persist upload: %w", errors.Join(err, cleanupErr))
 	}
 
+	s.partMu.Lock()
+	s.partDigests[id] = make(map[int][]string)
+	s.partMu.Unlock()
+
 	s.logger.Debug("multipart upload created", "upload_id", id, "bucket", bucket, "key", key)
 	return up, nil
 }
@@ -605,7 +616,14 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 		return Part{}, err
 	}
 
+	prevDigests, err := s.previousPartDigests(uploadID, dir, number)
+	if err != nil {
+		os.Remove(tmpPath)
+		return Part{}, fmt.Errorf("multipart: inspect upload dir: %w", err)
+	}
+
 	finalPath := filepath.Join(dir, partFileName(number, digest))
+	renamed := false
 	err = fileops.Do(s.rootDir, func() error {
 		_, statErr := os.Stat(finalPath)
 		if statErr != nil && !os.IsNotExist(statErr) {
@@ -614,6 +632,7 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 		if err := os.Rename(tmpPath, finalPath); err != nil {
 			return fmt.Errorf("multipart: publish part: %w", err)
 		}
+		renamed = true
 		// Persist the replacement before deleting the previously acknowledged
 		// digest. On failure keep that predecessor available for retry/recovery.
 		if err := s.syncDirectory(dir); err != nil {
@@ -622,15 +641,25 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 			}
 			return err
 		}
-		if err := s.removeSupersededParts(dir, number, digest); err != nil {
+		removed, err := s.removeSupersededParts(dir, number, digest, prevDigests)
+		if err != nil {
 			return err
 		}
-		return s.syncDirectory(dir)
+		if removed {
+			return s.syncDirectory(dir)
+		}
+		return nil
 	})
 	if err != nil {
+		if renamed {
+			// On-disk state may now differ from the cache; force a reload on the
+			// next WritePart for this upload.
+			s.forgetPartDigests(uploadID)
+		}
 		os.Remove(tmpPath)
 		return Part{}, fmt.Errorf("multipart: persist part: %w", err)
 	}
+	s.recordPartDigest(uploadID, number, digest)
 
 	info, err := os.Stat(finalPath)
 	modTime := time.Now().UTC()
@@ -642,22 +671,75 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 	return Part{Number: number, Size: size, ETag: digest, LastModified: modTime}, nil
 }
 
-// removeSupersededParts deletes any other staged file for this part number.
-func (s *Store) removeSupersededParts(dir string, number int, keepDigest string) error {
+// previousPartDigests returns the cached digests currently staged for part
+// number in uploadID, populating the upload's cache from disk once after restart.
+func (s *Store) previousPartDigests(uploadID, dir string, number int) ([]string, error) {
+	s.partMu.Lock()
+	if parts, ok := s.partDigests[uploadID]; ok {
+		prev := append([]string(nil), parts[number]...)
+		s.partMu.Unlock()
+		return prev, nil
+	}
+	s.partMu.Unlock()
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	loaded := make(map[int][]string)
 	for _, e := range entries {
-		n, digest, ok := parsePartFileName(e.Name())
-		if !ok || n != number || digest == keepDigest {
+		if e.IsDir() {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-			return err
+		n, d, ok := parsePartFileName(e.Name())
+		if !ok {
+			continue
 		}
+		loaded[n] = append(loaded[n], d)
 	}
-	return nil
+
+	s.partMu.Lock()
+	if cur, ok := s.partDigests[uploadID]; ok {
+		prev := append([]string(nil), cur[number]...)
+		s.partMu.Unlock()
+		return prev, nil
+	}
+	s.partDigests[uploadID] = loaded
+	prev := append([]string(nil), loaded[number]...)
+	s.partMu.Unlock()
+	return prev, nil
+}
+
+func (s *Store) recordPartDigest(uploadID string, number int, digest string) {
+	s.partMu.Lock()
+	if parts, ok := s.partDigests[uploadID]; ok {
+		parts[number] = []string{digest}
+	}
+	s.partMu.Unlock()
+}
+
+func (s *Store) forgetPartDigests(uploadID string) {
+	s.partMu.Lock()
+	delete(s.partDigests, uploadID)
+	s.partMu.Unlock()
+}
+
+// removeSupersededParts deletes previously staged files for this part number.
+func (s *Store) removeSupersededParts(dir string, number int, keepDigest string, prevDigests []string) (bool, error) {
+	removed := false
+	for _, digest := range prevDigests {
+		if digest == keepDigest {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, partFileName(number, digest))); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return removed, err
+		}
+		removed = true
+	}
+	return removed, nil
 }
 
 // stagedParts returns every part staged for an upload, ordered by part number.
@@ -811,6 +893,7 @@ func (s *Store) Abort(id string) error {
 	if err := s.removeStagingEntry(s.uploadDir(id)); err != nil {
 		return fmt.Errorf("multipart: abort upload: %w", err)
 	}
+	s.forgetPartDigests(id)
 	s.logger.Info("multipart upload aborted", "upload_id", id)
 	return nil
 }
@@ -925,6 +1008,7 @@ func (s *Store) CompleteIf(id string, want []CompletePart, dest string, precondi
 		// the janitor will collect, not a reason to fail the request.
 		s.logger.Warn("failed to remove staging dir after complete", "upload_id", id, "error", err)
 	}
+	s.forgetPartDigests(id)
 
 	s.logger.Info("multipart upload completed",
 		"upload_id", id, "bucket", up.Bucket, "key", up.Key, "parts", len(selected), "size", size)
@@ -1042,10 +1126,6 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string, p
 		return "", nil, fmt.Errorf("multipart: assembled file is %d bytes, expected %d", info.Size(), wantSize)
 	}
 
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("multipart: sync assembled object: %w", err)
-	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpPath)
 		return "", nil, fmt.Errorf("multipart: close assembled object: %w", err)
@@ -1073,13 +1153,33 @@ func etagMatches(clientETag, digest string) bool {
 // --- cleanup ---
 
 // All staging deletion shares the volume fence with public mutations.
+// Detach the entry under the lock with an O(1) rename into a trash path, then
+// remove the tree outside the lock so aborting or completing a large upload
+// does not stall unrelated commits.
 func (s *Store) removeStagingEntry(path string) error {
-	return fileops.Do(s.rootDir, func() error {
-		if err := os.RemoveAll(path); err != nil {
+	id, err := newUploadID()
+	if err != nil {
+		return err
+	}
+	trashPath := filepath.Join(s.stagingDir, tempPrefix+"trash-"+id)
+	fileops.RetainTemp(trashPath)
+	defer fileops.ReleaseTempPath(trashPath)
+
+	renamed := false
+	err = fileops.Do(s.rootDir, func() error {
+		if err := os.Rename(path, trashPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
+		renamed = true
 		return s.syncDirectory(s.stagingDir)
 	})
+	if err != nil || !renamed {
+		return err
+	}
+	return os.RemoveAll(trashPath)
 }
 
 // Cleanup removes uploads whose last activity is older than the TTL and reports
@@ -1105,7 +1205,14 @@ func (s *Store) Cleanup(now time.Time) int {
 		// Anything that is not a well-formed upload directory is junk from a crash
 		// or a stray write; drop it once it is older than the TTL as well.
 		if !e.IsDir() || !ValidUploadID(e.Name()) {
-			if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > s.limits.UploadTTL {
+			if fileops.ScratchActive(path) {
+				continue
+			}
+			maxAge := s.limits.UploadTTL
+			if strings.HasPrefix(e.Name(), tempPrefix+"trash-") {
+				maxAge = s.limits.TempFileMaxAge
+			}
+			if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > maxAge {
 				if err := s.removeStagingEntry(path); err != nil {
 					s.logger.Warn("multipart cleanup: remove stray entry failed", "path", path, "error", err)
 				}
@@ -1128,6 +1235,7 @@ func (s *Store) Cleanup(now time.Time) int {
 			if err := s.removeStagingEntry(path); err != nil {
 				s.logger.Warn("multipart cleanup: remove upload failed", "upload_id", e.Name(), "error", err)
 			} else {
+				s.forgetPartDigests(e.Name())
 				removed++
 				s.logger.Info("expired multipart upload removed", "upload_id", e.Name(), "idle", now.Sub(cur).String())
 			}

@@ -241,9 +241,6 @@ func (g *Gateway) publishAcrossFilesystems(staged *stagedFile, dest string) erro
 	}
 	defer fileops.ReleaseTemp(tmp)
 	_, err = io.Copy(tmp, src)
-	if err == nil {
-		err = tmp.Sync()
-	}
 	if err = errors.Join(err, tmp.Close()); err == nil {
 		err = fileops.Publish(g.rootDir, tmp.Name(), dest)
 	}

@@ -102,9 +102,9 @@ func (g *Gateway) Stop(ctx context.Context) error {
 }
 
 // extractBucketFromHost detects virtual-hosted-style requests when a domain
-// is configured. It strips the port, then checks if the hostname ends with
-// ".{domain}" and extracts the prefix as the bucket name.
-// Example: domain="localhost", Host="mybucket.localhost:9200" → "mybucket".
+// is configured. It strips the port (IPv6-safe), then checks if the hostname
+// ends with ".{domain}" (case-insensitive) and extracts the prefix as the bucket
+// name. Example: domain="localhost", Host="mybucket.localhost:9200" → "mybucket".
 // Returns "" if domain is not configured or the host doesn't match.
 func (g *Gateway) extractBucketFromHost(host string) string {
 	if g.config.Domain == "" {
@@ -112,16 +112,19 @@ func (g *Gateway) extractBucketFromHost(host string) string {
 	}
 
 	h := host
-	if idx := strings.LastIndex(h, ":"); idx != -1 {
-		h = h[:idx]
+	if parsedHost, _, err := net.SplitHostPort(h); err == nil {
+		h = parsedHost
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
 	}
 
-	suffix := "." + g.config.Domain
-	if !strings.HasSuffix(h, suffix) {
+	suffix := "." + strings.ToLower(g.config.Domain)
+	if !strings.HasSuffix(strings.ToLower(h), suffix) {
 		return ""
 	}
 
-	bucket := strings.TrimSuffix(h, suffix)
+	bucket := h[:len(h)-len(suffix)]
 	if bucket == "" {
 		return ""
 	}

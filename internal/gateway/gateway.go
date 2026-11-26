@@ -139,8 +139,11 @@ func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
 			return nil
 		}
 		if d.IsDir() {
-			// COPY staging is private and only disposable without a journal.
+			// COPY staging is private and only disposable without a journal or active builder.
 			if strings.HasPrefix(d.Name(), ".seb-tmp-replace-") {
+				if fileops.ScratchActive(path) {
+					return fs.SkipDir
+				}
 				info, statErr := d.Info()
 				if statErr == nil && stale(info) {
 					if err := removeScratch(rootDir, path, true, stale, logger); err != nil {
@@ -203,16 +206,13 @@ func removeScratch(rootDir, path string, stage bool, stale func(fs.FileInfo) boo
 	}
 	defer root.Close()
 	info, err := root.Lstat(rel)
-	if err != nil || info.IsDir() != stage || !stale(info) {
+	if err != nil || info.IsDir() != stage || !stale(info) || fileops.ScratchActive(path) {
 		return nil
 	}
 	if stage {
 		if err := root.RemoveAll(rel); err != nil {
 			logger.Warn("failed to remove orphan COPY stage", "path", path, "error", err)
 		}
-		return nil
-	}
-	if fileops.ScratchActive(path) {
 		return nil
 	}
 	if err := root.Remove(rel); err != nil {

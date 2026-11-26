@@ -27,6 +27,7 @@ import (
 const maxHandlesPerSession = 1024
 
 type handleEntry struct {
+	mu         sync.Mutex
 	path       string
 	appendMode bool
 	writable   bool
@@ -520,7 +521,7 @@ func (s *session) handleWrite(payload []byte) {
 		return
 	}
 
-	err = fileops.Do(s.g.rootDir, func() error {
+	writeChunk := func() error {
 		// APPEND ignores the client offset. Keep O_APPEND for atomic OS appends.
 		if entry.appendMode {
 			info, statErr := entry.file.Stat()
@@ -530,10 +531,10 @@ func (s *session) handleWrite(payload []byte) {
 			offset = uint64(info.Size())
 		}
 		if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64-offset {
-			return fmt.Errorf("upload exceeds maximum size")
+			return errUploadTooLarge
 		}
 		if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
-			return fmt.Errorf("upload exceeds maximum size")
+			return errUploadTooLarge
 		}
 		if entry.appendMode {
 			_, err = entry.file.Write([]byte(data))
@@ -541,8 +542,22 @@ func (s *session) handleWrite(payload []byte) {
 			_, err = entry.file.WriteAt([]byte(data), int64(offset))
 		}
 		return err
-	})
+	}
+	// Only size-capped appends need cross-handle serialization under the root
+	// lock so Stat+Write cannot race another appender past MaxUploadBytes; regular
+	// positioned writes operate on the open fd under the per-handle mutex.
+	if entry.appendMode && s.g.config.MaxUploadBytes > 0 {
+		err = fileops.Do(s.g.rootDir, writeChunk)
+	} else {
+		entry.mu.Lock()
+		err = writeChunk()
+		entry.mu.Unlock()
+	}
 	if err != nil {
+		if errors.Is(err, errUploadTooLarge) {
+			s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+			return
+		}
 		s.sendStatus(id, sshFxFailure, "write error")
 		return
 	}

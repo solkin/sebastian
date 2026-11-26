@@ -342,9 +342,6 @@ func (g *Gateway) stageCopy(src *sourceObject, tmp *os.File) error {
 	if err == nil && n != src.info.Size() {
 		err = errSourceChanged
 	}
-	if err == nil {
-		err = tmp.Sync()
-	}
 	if err = errors.Join(err, tmp.Close()); err != nil {
 		return err
 	}

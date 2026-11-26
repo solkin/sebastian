@@ -62,9 +62,9 @@ func SameGeneration(a, b os.FileInfo) bool {
 // TryLock is Lock that does not wait: ok is false when another mutation of
 // the root holds it. It lets a test observe whether long work holds the lock.
 func TryLock(dir string) (unlock func(), ok bool) {
-	mutex := root(dir)
-	if !mutex.TryLock() {
+	r := root(dir)
+	if !r.mu.TryLock() {
 		return nil, false
 	}
-	return mutex.Unlock, true
+	return r.mu.Unlock, true
 }
