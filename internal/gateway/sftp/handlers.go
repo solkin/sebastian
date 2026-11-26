@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -394,7 +395,7 @@ func (s *session) handleOpen(payload []byte) {
 	var f *os.File
 	err = fileops.Do(s.g.rootDir, func() error {
 		var openErr error
-		f, openErr = os.OpenFile(fullPath, flag, 0o644)
+		f, openErr = fileops.OpenRegularFile(fullPath, flag, 0o644)
 		return openErr
 	})
 	if err != nil {
@@ -520,6 +521,9 @@ func (s *session) handleWrite(payload []byte) {
 				return statErr
 			}
 			offset = uint64(info.Size())
+		}
+		if offset > math.MaxInt64 || uint64(len(data)) > math.MaxInt64-offset {
+			return fmt.Errorf("upload exceeds maximum size")
 		}
 		if max := s.g.config.MaxUploadBytes; max > 0 && (offset > uint64(max) || uint64(len(data)) > uint64(max)-offset) {
 			return fmt.Errorf("upload exceeds maximum size")

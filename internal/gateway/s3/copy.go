@@ -114,7 +114,7 @@ type copySource interface {
 // openCopySource opens a copy source. Tests replace it to observe a copy in
 // flight.
 var openCopySource = func(path string) (copySource, error) {
-	f, err := os.Open(path)
+	f, err := fileops.OpenRegular(path)
 	if err != nil {
 		return nil, err
 	}

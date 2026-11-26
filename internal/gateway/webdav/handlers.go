@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/solkin/sebastian/internal/fileops"
@@ -152,28 +154,26 @@ func (g *Gateway) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := os.Stat(fullPath)
-	if os.IsNotExist(err) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
+	f, err := fileops.OpenRegular(fullPath)
 	if err != nil {
-		g.logger.Error("get stat failed", "path", relName, "error", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	if info.IsDir() {
-		http.Error(w, "Not a file", http.StatusMethodNotAllowed)
-		return
-	}
-
-	f, err := os.Open(fullPath)
-	if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		case errors.Is(err, syscall.EISDIR):
+			http.Error(w, "Not a file", http.StatusMethodNotAllowed)
+			return
+		}
 		g.logger.Error("get open failed", "path", relName, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "file unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	g.logger.Debug("serving file", "path", relName, "size", info.Size())
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -751,7 +751,7 @@ func (c *copier) copyFile(src, dst string) error {
 		return errUploadTooLarge
 	}
 
-	sf, err := os.Open(src)
+	sf, err := fileops.OpenRegular(src)
 	if err != nil {
 		return err
 	}

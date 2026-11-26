@@ -785,7 +785,7 @@ func (g *Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	f, err := os.Open(op)
+	f, err := fileops.OpenRegular(op)
 	if err != nil {
 		if readMissing(err) {
 			// Deleted between the stat and the open.

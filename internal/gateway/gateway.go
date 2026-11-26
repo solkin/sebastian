@@ -122,26 +122,30 @@ func IsScratchFile(name string) bool {
 
 // SweepTempFiles removes inactive temporary files and COPY stages.
 // Recovery backups are preserved, and pending journals defer all cleanup.
+//
+// The walk reads every directory of the volume, so it runs without the commit
+// lock: held for the whole walk, it stopped every commit on the node for as
+// long as the tree took to read. Each candidate is removed under the lock,
+// after checking again that it is still stale, unowned scratch.
 func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
-	unlock := fileops.Lock(rootDir)
-	defer unlock()
-	if pending, err := fileops.ReplacementPendingLocked(rootDir); err != nil || pending {
-		logger.Debug("defer scratch cleanup until replacement recovery completes", "error", err)
+	if err := sweepAllowed(rootDir); err != nil {
+		logger.Debug("defer scratch cleanup", "error", err)
 		return
 	}
 	cutoff := time.Now().Add(-maxAge)
+	stale := func(info fs.FileInfo) bool { return maxAge <= 0 || !info.ModTime().After(cutoff) }
 	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
 			// COPY staging is private and only disposable without a journal.
-			// The root lock excludes an active builder for the entire sweep.
 			if strings.HasPrefix(d.Name(), ".seb-tmp-replace-") {
 				info, statErr := d.Info()
-				if statErr == nil && (maxAge <= 0 || !info.ModTime().After(cutoff)) {
-					if err := os.RemoveAll(path); err != nil {
-						logger.Warn("failed to remove orphan COPY stage", "path", path, "error", err)
+				if statErr == nil && stale(info) {
+					if err := removeScratch(rootDir, path, true, stale, logger); err != nil {
+						logger.Debug("defer scratch cleanup", "error", err)
+						return fs.SkipAll
 					}
 				}
 				return fs.SkipDir
@@ -156,17 +160,67 @@ func SweepTempFiles(rootDir string, maxAge time.Duration, logger *slog.Logger) {
 		}
 		if maxAge > 0 {
 			info, statErr := d.Info()
-			if statErr != nil || info.ModTime().After(cutoff) {
+			if statErr != nil || !stale(info) {
 				return nil
 			}
 		}
-		if rmErr := os.Remove(path); rmErr != nil {
-			logger.Warn("failed to remove stale temp file", "path", path, "error", rmErr)
-		} else {
-			logger.Info("removed stale temp file", "path", path)
+		if err := removeScratch(rootDir, path, false, stale, logger); err != nil {
+			logger.Debug("defer scratch cleanup", "error", err)
+			return fs.SkipAll
 		}
 		return nil
 	})
+}
+
+func sweepAllowed(rootDir string) error {
+	unlock := fileops.Lock(rootDir)
+	defer unlock()
+	return sweepAllowedLocked(rootDir)
+}
+
+func sweepAllowedLocked(rootDir string) error {
+	if pending, err := fileops.ReplacementPendingLocked(rootDir); err != nil {
+		return fmt.Errorf("replacement recovery: %w", err)
+	} else if pending {
+		return fmt.Errorf("replacement recovery has not completed")
+	}
+	return nil
+}
+
+func removeScratch(rootDir, path string, stage bool, stale func(fs.FileInfo) bool, logger *slog.Logger) error {
+	unlock := fileops.Lock(rootDir)
+	defer unlock()
+	if err := sweepAllowedLocked(rootDir); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootDir, path)
+	if err != nil {
+		return nil
+	}
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	info, err := root.Lstat(rel)
+	if err != nil || info.IsDir() != stage || !stale(info) {
+		return nil
+	}
+	if stage {
+		if err := root.RemoveAll(rel); err != nil {
+			logger.Warn("failed to remove orphan COPY stage", "path", path, "error", err)
+		}
+		return nil
+	}
+	if fileops.ScratchActive(path) {
+		return nil
+	}
+	if err := root.Remove(rel); err != nil {
+		logger.Warn("failed to remove stale temp file", "path", path, "error", err)
+	} else {
+		logger.Info("removed stale temp file", "path", path)
+	}
+	return nil
 }
 
 // SafePath validates reqPath and returns the cleaned relative path and full

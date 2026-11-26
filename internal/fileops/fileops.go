@@ -12,16 +12,33 @@ import (
 )
 
 var roots sync.Map
+var rootsMu sync.Mutex // binds alternate names to one stable mutex
+
+func root(dir string) *sync.Mutex {
+	abs, _ := filepath.Abs(dir)
+	if v, ok := roots.Load(abs); ok {
+		return v.(*sync.Mutex)
+	}
+	rootsMu.Lock()
+	defer rootsMu.Unlock()
+	if v, ok := roots.Load(abs); ok {
+		return v.(*sync.Mutex)
+	}
+	real := canonical(abs)
+	v, ok := roots.Load(real)
+	if !ok {
+		v = new(sync.Mutex)
+		roots.Store(real, v)
+	}
+	// Keep an established spelling bound even if a symlink/mount is replaced.
+	roots.Store(abs, v)
+	return v.(*sync.Mutex)
+}
 
 // Lock serializes mutations through alternate spellings of the same root.
 // Callers must not acquire it recursively.
 func Lock(dir string) func() {
-	abs, _ := filepath.Abs(dir)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
-	value, _ := roots.LoadOrStore(abs, new(sync.Mutex))
-	mutex := value.(*sync.Mutex)
+	mutex := root(dir)
 	mutex.Lock()
 	return mutex.Unlock
 }

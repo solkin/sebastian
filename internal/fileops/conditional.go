@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
 // PublishIf is Publish for a write that depends on what the destination is
@@ -63,12 +62,7 @@ func SameGeneration(a, b os.FileInfo) bool {
 // TryLock is Lock that does not wait: ok is false when another mutation of
 // the root holds it. It lets a test observe whether long work holds the lock.
 func TryLock(dir string) (unlock func(), ok bool) {
-	abs, _ := filepath.Abs(dir)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
-	value, _ := roots.LoadOrStore(abs, new(sync.Mutex))
-	mutex := value.(*sync.Mutex)
+	mutex := root(dir)
 	if !mutex.TryLock() {
 		return nil, false
 	}

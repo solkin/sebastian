@@ -206,10 +206,11 @@ type CompleteResult struct {
 
 // Store manages staged multipart uploads under a root directory.
 type Store struct {
-	rootDir    string
-	stagingDir string
-	limits     Limits
-	logger     *slog.Logger
+	rootDir       string
+	stagingDir    string
+	limits        Limits
+	logger        *slog.Logger
+	syncDirectory func(string) error
 
 	// createMu serializes Create so the active-upload cap cannot be overshot by
 	// concurrent initiations.
@@ -236,15 +237,19 @@ func New(rootDir string, limits Limits, logger *slog.Logger) (*Store, error) {
 	if err := os.MkdirAll(staging, 0o700); err != nil {
 		return nil, fmt.Errorf("multipart: create staging dir: %w", err)
 	}
+	if err := fileops.SyncParents(staging, rootDir); err != nil {
+		return nil, fmt.Errorf("multipart: persist staging dir: %w", err)
+	}
 
 	limits = limits.withDefaults()
 
 	s := &Store{
-		rootDir:    rootDir,
-		stagingDir: staging,
-		limits:     limits,
-		logger:     logger.With("component", "multipart"),
-		locks:      make(map[string]*uploadLock),
+		rootDir:       rootDir,
+		stagingDir:    staging,
+		limits:        limits,
+		logger:        logger.With("component", "multipart"),
+		syncDirectory: fileops.SyncDir,
+		locks:         make(map[string]*uploadLock),
 	}
 	if limits.MaxConcurrentParts > 0 {
 		s.sem = make(chan struct{}, limits.MaxConcurrentParts)
@@ -388,7 +393,7 @@ func (s *Store) readMeta(id string) (Upload, error) {
 
 // writeMeta writes the descriptor atomically and flushes it, so an upload that
 // exists after a crash is always fully described.
-func writeMeta(dir string, up Upload) error {
+func (s *Store) writeMeta(dir string, up Upload) error {
 	data, err := json.Marshal(up)
 	if err != nil {
 		return fmt.Errorf("multipart: encode upload metadata: %w", err)
@@ -417,19 +422,7 @@ func writeMeta(dir string, up Upload) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("multipart: publish metadata: %w", err)
 	}
-	rootDir(dir)
-	return nil
-}
-
-// rootDir flushes a directory entry change so a rename survives a power loss.
-// Failures are not fatal: some filesystems refuse to sync directories.
-func rootDir(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	d.Sync()
-	d.Close()
+	return s.syncDirectory(dir)
 }
 
 // --- upload lifecycle ---
@@ -455,10 +448,6 @@ func (s *Store) Create(bucket, key string) (Upload, error) {
 	}
 
 	dir := s.uploadDir(id)
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		return Upload{}, fmt.Errorf("multipart: create upload dir: %w", err)
-	}
-
 	up := Upload{
 		ID:     id,
 		Bucket: bucket,
@@ -467,11 +456,29 @@ func (s *Store) Create(bucket, key string) (Upload, error) {
 		// so a listed Initiated value round-trips exactly.
 		Initiated: time.Now().UTC().Truncate(time.Millisecond),
 	}
-	if err := writeMeta(dir, up); err != nil {
-		os.RemoveAll(dir)
-		return Upload{}, err
+	created := false
+	err = fileops.Do(s.rootDir, func() error {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			return err
+		}
+		created = true
+		if err := s.writeMeta(dir, up); err != nil {
+			return err
+		}
+		return s.syncDirectory(s.stagingDir)
+	})
+	if err != nil {
+		if !created {
+			return Upload{}, err
+		}
+		cleanupErr := fileops.Do(s.rootDir, func() error {
+			if err := os.RemoveAll(dir); err != nil {
+				return err
+			}
+			return s.syncDirectory(s.stagingDir)
+		})
+		return Upload{}, fmt.Errorf("multipart: persist upload: %w", errors.Join(err, cleanupErr))
 	}
-	rootDir(s.stagingDir)
 
 	s.logger.Debug("multipart upload created", "upload_id", id, "bucket", bucket, "key", key)
 	return up, nil
@@ -599,14 +606,31 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 	}
 
 	finalPath := filepath.Join(dir, partFileName(number, digest))
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	err = fileops.Do(s.rootDir, func() error {
+		_, statErr := os.Stat(finalPath)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return statErr
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			return fmt.Errorf("multipart: publish part: %w", err)
+		}
+		// Persist the replacement before deleting the previously acknowledged
+		// digest. On failure keep that predecessor available for retry/recovery.
+		if err := s.syncDirectory(dir); err != nil {
+			if os.IsNotExist(statErr) {
+				err = errors.Join(err, os.Remove(finalPath), s.syncDirectory(dir))
+			}
+			return err
+		}
+		if err := s.removeSupersededParts(dir, number, digest); err != nil {
+			return err
+		}
+		return s.syncDirectory(dir)
+	})
+	if err != nil {
 		os.Remove(tmpPath)
-		return Part{}, fmt.Errorf("multipart: publish part: %w", err)
+		return Part{}, fmt.Errorf("multipart: persist part: %w", err)
 	}
-	// A re-upload with different content lands under a different name; drop the
-	// superseded copy so exactly one file per part number remains.
-	s.removeSupersededParts(dir, number, digest)
-	rootDir(dir)
 
 	info, err := os.Stat(finalPath)
 	modTime := time.Now().UTC()
@@ -619,10 +643,10 @@ func (s *Store) WritePart(uploadID string, number int, body io.Reader, checks Ch
 }
 
 // removeSupersededParts deletes any other staged file for this part number.
-func (s *Store) removeSupersededParts(dir string, number int, keepDigest string) {
+func (s *Store) removeSupersededParts(dir string, number int, keepDigest string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return err
 	}
 	for _, e := range entries {
 		n, digest, ok := parsePartFileName(e.Name())
@@ -630,9 +654,10 @@ func (s *Store) removeSupersededParts(dir string, number int, keepDigest string)
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-			s.logger.Warn("failed to remove superseded part", "dir", dir, "part", number, "error", err)
+			return err
 		}
 	}
+	return nil
 }
 
 // stagedParts returns every part staged for an upload, ordered by part number.
@@ -783,7 +808,7 @@ func (s *Store) Abort(id string) error {
 	if _, err := s.readMeta(id); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(s.uploadDir(id)); err != nil {
+	if err := s.removeStagingEntry(s.uploadDir(id)); err != nil {
 		return fmt.Errorf("multipart: abort upload: %w", err)
 	}
 	s.logger.Info("multipart upload aborted", "upload_id", id)
@@ -895,7 +920,7 @@ func (s *Store) CompleteIf(id string, want []CompletePart, dest string, precondi
 			"upload_id", id, "error", err)
 	}
 
-	if err := os.RemoveAll(s.uploadDir(id)); err != nil {
+	if err := s.removeStagingEntry(s.uploadDir(id)); err != nil {
 		// The object is already published; a leftover staging directory is garbage
 		// the janitor will collect, not a reason to fail the request.
 		s.logger.Warn("failed to remove staging dir after complete", "upload_id", id, "error", err)
@@ -1031,7 +1056,6 @@ func (s *Store) assemble(id string, parts []Part, wantSize int64, dest string, p
 		os.Remove(tmpPath)
 		return "", nil, fmt.Errorf("multipart: publish object: %w", err)
 	}
-	rootDir(destDir)
 
 	etag := fmt.Sprintf("%s-%d", hex.EncodeToString(composite.Sum(nil)), len(parts))
 	return etag, info, nil
@@ -1047,6 +1071,16 @@ func etagMatches(clientETag, digest string) bool {
 }
 
 // --- cleanup ---
+
+// All staging deletion shares the volume fence with public mutations.
+func (s *Store) removeStagingEntry(path string) error {
+	return fileops.Do(s.rootDir, func() error {
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+		return s.syncDirectory(s.stagingDir)
+	})
+}
 
 // Cleanup removes uploads whose last activity is older than the TTL and reports
 // how many were removed. An upload's activity is the newest timestamp among its
@@ -1072,7 +1106,7 @@ func (s *Store) Cleanup(now time.Time) int {
 		// or a stray write; drop it once it is older than the TTL as well.
 		if !e.IsDir() || !ValidUploadID(e.Name()) {
 			if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > s.limits.UploadTTL {
-				if err := os.RemoveAll(path); err != nil {
+				if err := s.removeStagingEntry(path); err != nil {
 					s.logger.Warn("multipart cleanup: remove stray entry failed", "path", path, "error", err)
 				}
 			}
@@ -1091,7 +1125,7 @@ func (s *Store) Cleanup(now time.Time) int {
 		// published or an in-flight completion.
 		l := s.lock(e.Name())
 		if cur, err := lastActivity(path); err == nil && now.Sub(cur) > s.limits.UploadTTL {
-			if err := os.RemoveAll(path); err != nil {
+			if err := s.removeStagingEntry(path); err != nil {
 				s.logger.Warn("multipart cleanup: remove upload failed", "upload_id", e.Name(), "error", err)
 			} else {
 				removed++

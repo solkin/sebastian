@@ -227,9 +227,9 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(fullPath)
+	f, err := fileops.OpenRegular(fullPath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || invalidName(err) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || invalidName(err) {
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
@@ -242,10 +242,6 @@ func (g *Gateway) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		g.logger.Error("download failed", "path", rel, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	if info.IsDir() {
-		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
 

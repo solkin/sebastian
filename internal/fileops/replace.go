@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -462,9 +463,16 @@ func ReplacementPendingLocked(root string) (bool, error) {
 
 // Old releases did not journal backup destinations. Refuse to accept mutations
 // while an unmapped backup exists: guessing or sweeping it can destroy data.
+//
+// A directory below the root that this process may not read is passed over so
+// one unreadable subdirectory cannot put the server into a restart loop. An
+// unreadable root is still an error.
 func CheckOrphanedBackups(root string, ignore func(string) bool) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if path != root && errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
 			return err
 		}
 		if path != root && strings.HasPrefix(d.Name(), ".seb-bak-") {
