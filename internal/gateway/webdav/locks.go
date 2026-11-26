@@ -64,42 +64,46 @@ func (m *lockManager) reap(now time.Time) {
 // create attempts to add an exclusive lock over path. It fails (ok=false) if an
 // existing lock already covers path, if a requested infinity lock would overlap a
 // descendant lock, or if the lock table is full.
-func (m *lockManager) create(path, depth string, timeout time.Duration) (*lock, bool) {
+func (m *lockManager) create(path, depth string, timeout time.Duration) (lock, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
 	m.reap(now)
 
 	if len(m.locks) >= maxLocks {
-		return nil, false
+		return lock{}, false
 	}
 	for _, lk := range m.locks {
 		if lk.covers(path) {
-			return nil, false
+			return lock{}, false
 		}
 		if depth == "infinity" && isDescendant(lk.path, path) {
-			return nil, false
+			return lock{}, false
 		}
 	}
 
-	lk := &lock{token: newLockToken(), path: path, depth: depth, expires: now.Add(timeout)}
+	token, ok := newLockToken()
+	if !ok {
+		return lock{}, false
+	}
+	lk := &lock{token: token, path: path, depth: depth, expires: now.Add(timeout)}
 	m.locks[lk.token] = lk
-	return lk, true
+	return *lk, true
 }
 
-// refresh extends an existing lock identified by token. ok=false if no live lock
-// with that token exists.
-func (m *lockManager) refresh(token string, timeout time.Duration) (*lock, bool) {
+// refreshForPath extends an existing lock identified by token only if it covers
+// path, returning a snapshot copy without exposing the map entry pointer.
+func (m *lockManager) refreshForPath(token, path string, timeout time.Duration) (lock, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
 	m.reap(now)
 	lk, ok := m.locks[token]
-	if !ok {
-		return nil, false
+	if !ok || !lk.covers(path) {
+		return lock{}, false
 	}
 	lk.expires = now.Add(timeout)
-	return lk, true
+	return *lk, true
 }
 
 // unlock removes the lock identified by token. ok=false if it does not exist.
@@ -129,6 +133,22 @@ func (m *lockManager) canModify(path, ifHeader string) bool {
 	return true
 }
 
+// canModifyTree reports whether a destructive/tree mutation on path (DELETE,
+// MOVE, overwriting COPY) is allowed: neither path nor any descendant under it
+// may hold a lock whose token is absent from the request's If header.
+func (m *lockManager) canModifyTree(path, ifHeader string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reap(time.Now())
+	tokens := parseIfTokens(ifHeader)
+	for _, lk := range m.locks {
+		if (lk.covers(path) || isDescendant(lk.path, path)) && !tokens[lk.token] {
+			return false
+		}
+	}
+	return true
+}
+
 // isDescendant reports whether p lies strictly within ancestor's subtree.
 func isDescendant(p, ancestor string) bool {
 	if ancestor == "" {
@@ -138,10 +158,12 @@ func isDescendant(p, ancestor string) bool {
 }
 
 // newLockToken returns a fresh opaque lock token.
-func newLockToken() string {
+func newLockToken() (string, bool) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return "opaquelocktoken:" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", false
+	}
+	return "opaquelocktoken:" + hex.EncodeToString(b), true
 }
 
 // parseIfTokens extracts every angle-bracketed token from an If header. The

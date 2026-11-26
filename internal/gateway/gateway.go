@@ -338,7 +338,10 @@ func resolveNoSymlinkEscape(rootDir, full string) (resolvedPath, realRoot string
 		return absFull, absRoot, false, nil
 	}
 
-	resolved := evalDeepestAncestor(absFull)
+	resolved, err := resolvePath(absFull)
+	if err != nil {
+		return "", realRoot, true, fmt.Errorf("path traversal: %w", err)
+	}
 	if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
 		return "", realRoot, true, fmt.Errorf("path traversal")
 	}

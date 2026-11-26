@@ -25,6 +25,10 @@ import (
 // memory it can hold is bounded and obvious.
 const QueueDepth = 4096
 
+// closeTimeout bounds how long Close waits for a stalled log consumer to drain
+// queued records before giving up so graceful shutdown never hangs until SIGKILL.
+var closeTimeout = 2 * time.Second
+
 type entry struct {
 	handler slog.Handler
 	record  slog.Record
@@ -43,9 +47,10 @@ type shared struct {
 	// during or after shutdown would then be a send on a closed channel, and
 	// taking the process down over a log line is exactly the failure this
 	// package exists to prevent.
-	stop   chan struct{}
-	closed sync.Once
-	wg     sync.WaitGroup
+	stop    chan struct{}
+	stopped atomic.Bool
+	closed  sync.Once
+	wg      sync.WaitGroup
 }
 
 // NewAsync wraps a handler. Close flushes what is queued and stops the writer.
@@ -73,16 +78,17 @@ func (h *Async) run() {
 			_ = e.handler.Handle(context.Background(), e.record)
 		case <-report.C:
 			if total := h.dropped.Load(); total > reported {
-				h.inner.Handle(context.Background(), slog.NewRecord(
+				rec := slog.NewRecord(
 					time.Now(), slog.LevelWarn,
 					"log records dropped; the log consumer is not keeping up", 0,
-				))
+				)
+				rec.AddAttrs(slog.Int64("dropped", total-reported))
+				_ = h.inner.Handle(context.Background(), rec)
 				reported = total
 			}
 		case <-h.shared.stop:
-			// Write what is already queued, then leave. Records that arrive
-			// after this simply have nobody to write them.
-			for {
+			// Write what was already queued at stop time, then leave.
+			for rem := len(h.shared.queue); rem > 0; rem-- {
 				select {
 				case e := <-h.shared.queue:
 					_ = e.handler.Handle(context.Background(), e.record)
@@ -90,6 +96,7 @@ func (h *Async) run() {
 					return
 				}
 			}
+			return
 		}
 	}
 }
@@ -101,6 +108,9 @@ func (h *Async) Enabled(ctx context.Context, level slog.Level) bool {
 
 // Handle queues a record. It never waits: a full queue drops.
 func (h *Async) Handle(ctx context.Context, r slog.Record) error {
+	if h.shared.stopped.Load() {
+		return nil
+	}
 	select {
 	case h.shared.queue <- entry{handler: h.inner, record: r.Clone()}:
 	default:
@@ -120,12 +130,23 @@ func (h *Async) WithGroup(name string) slog.Handler {
 // Dropped counts records discarded because the consumer fell behind.
 func (h *Async) Dropped() int64 { return h.dropped.Load() }
 
-// Close drains what is queued and stops the writer. Records logged afterwards
-// are accepted and discarded rather than written, so a late log line from a
-// deferred shutdown step is harmless.
+// Close drains what is queued and stops the writer, bounded by closeTimeout so
+// a stalled consumer cannot hang shutdown. Records logged afterwards are
+// accepted and discarded rather than written.
 func (h *Async) Close() {
 	h.shared.closed.Do(func() {
+		h.shared.stopped.Store(true)
 		close(h.shared.stop)
-		h.shared.wg.Wait()
+		done := make(chan struct{})
+		go func() {
+			h.shared.wg.Wait()
+			close(done)
+		}()
+		timer := time.NewTimer(closeTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
 	})
 }

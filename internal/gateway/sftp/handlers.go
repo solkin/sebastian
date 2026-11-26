@@ -9,7 +9,9 @@ import (
 	"math"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,16 +35,27 @@ type handleEntry struct {
 	isDir      bool
 }
 
+var errUploadTooLarge = errors.New("upload exceeds maximum size")
+
 type session struct {
 	g       *Gateway
+	conn    net.Conn
 	ch      ssh.Channel
 	handles map[string]*handleEntry
 	mu      sync.Mutex
 }
 
+func (s *session) sendPacket(pktType byte, payload []byte) error {
+	if s.conn != nil {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(sftpIdleTimeout))
+	}
+	return writePacket(s.ch, pktType, payload)
+}
+
 func (g *Gateway) serveSFTP(conn net.Conn, ch ssh.Channel) {
 	s := &session{
 		g:       g,
+		conn:    conn,
 		ch:      ch,
 		handles: make(map[string]*handleEntry),
 	}
@@ -64,7 +77,7 @@ func (g *Gateway) serveSFTP(conn net.Conn, ch ssh.Channel) {
 
 	var resp []byte
 	resp = marshalUint32(resp, sftpProtocolVersion)
-	if err := writePacket(ch, sshFxpVersion, resp); err != nil {
+	if err := s.sendPacket(sshFxpVersion, resp); err != nil {
 		return
 	}
 
@@ -132,19 +145,13 @@ func (s *session) handleRealpath(payload []byte) {
 	if err != nil {
 		return
 	}
-	path, _, err := unmarshalString(rest)
+	reqPath, _, err := unmarshalString(rest)
 	if err != nil {
 		s.sendStatus(id, sshFxBadMessage, "bad message")
 		return
 	}
 
-	cleaned := filepath.ToSlash(filepath.Clean(path))
-	if cleaned == "." || cleaned == "" {
-		cleaned = "/"
-	}
-	if cleaned[0] != '/' {
-		cleaned = "/" + cleaned
-	}
+	cleaned := path.Clean("/" + strings.ReplaceAll(reqPath, "\\", "/"))
 
 	var resp []byte
 	resp = marshalUint32(resp, id)
@@ -152,7 +159,7 @@ func (s *session) handleRealpath(payload []byte) {
 	resp = marshalString(resp, cleaned)
 	resp = marshalString(resp, cleaned) // long name
 	resp = marshalUint32(resp, 0)       // empty attrs
-	writePacket(s.ch, sshFxpName, resp)
+	s.sendPacket(sshFxpName, resp)
 }
 
 // handleStat serves SSH_FXP_STAT (statFn=os.Stat, follows symlinks) and
@@ -183,7 +190,7 @@ func (s *session) handleStat(payload []byte, statFn func(string) (os.FileInfo, e
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalAttrs(resp, fi)
-	writePacket(s.ch, sshFxpAttrs, resp)
+	s.sendPacket(sshFxpAttrs, resp)
 }
 
 func (s *session) handleFstat(payload []byte) {
@@ -222,7 +229,7 @@ func (s *session) handleFstat(payload []byte) {
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalAttrs(resp, fi)
-	writePacket(s.ch, sshFxpAttrs, resp)
+	s.sendPacket(sshFxpAttrs, resp)
 }
 
 func (s *session) handleOpendir(payload []byte) {
@@ -264,7 +271,7 @@ func (s *session) handleOpendir(payload []byte) {
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalString(resp, handle)
-	writePacket(s.ch, sshFxpHandle, resp)
+	s.sendPacket(sshFxpHandle, resp)
 }
 
 // readdirBatchSize bounds how many entries a single SSH_FXP_READDIR returns, so
@@ -331,7 +338,7 @@ func (s *session) handleReaddir(payload []byte) {
 		resp = marshalUint32(resp, id)
 		resp = marshalUint32(resp, uint32(count))
 		resp = append(resp, body...)
-		writePacket(s.ch, sshFxpName, resp)
+		s.sendPacket(sshFxpName, resp)
 		return
 	}
 }
@@ -420,7 +427,7 @@ func (s *session) handleOpen(payload []byte) {
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalString(resp, handle)
-	writePacket(s.ch, sshFxpHandle, resp)
+	s.sendPacket(sshFxpHandle, resp)
 }
 
 func (s *session) handleRead(payload []byte) {
@@ -463,7 +470,7 @@ func (s *session) handleRead(payload []byte) {
 		var resp []byte
 		resp = marshalUint32(resp, id)
 		resp = marshalBytes(resp, nil)
-		writePacket(s.ch, sshFxpData, resp)
+		s.sendPacket(sshFxpData, resp)
 		return
 	}
 
@@ -481,7 +488,7 @@ func (s *session) handleRead(payload []byte) {
 	var resp []byte
 	resp = marshalUint32(resp, id)
 	resp = marshalBytes(resp, buf[:n])
-	writePacket(s.ch, sshFxpData, resp)
+	s.sendPacket(sshFxpData, resp)
 }
 
 func (s *session) handleWrite(payload []byte) {
@@ -605,7 +612,7 @@ func (s *session) handleRemove(payload []byte) {
 		return
 	}
 
-	fi, err := os.Stat(fullPath)
+	fi, err := os.Lstat(fullPath)
 	if err != nil {
 		s.sendStatus(id, sshFxNoSuchFile, "no such file")
 		return
@@ -713,6 +720,10 @@ func (s *session) handleRename(payload []byte) {
 		s.sendStatus(id, sshFxPermissionDenied, "access denied")
 		return
 	}
+	if isRootPath(s.g.rootDir, oldFull) || isRootPath(s.g.rootDir, newFull) {
+		s.sendStatus(id, sshFxPermissionDenied, "cannot rename root directory")
+		return
+	}
 
 	if err := fileops.Rename(s.g.rootDir, oldFull, newFull); err != nil {
 		s.sendFailure(id, err)
@@ -749,7 +760,11 @@ func (s *session) handleSetstat(payload []byte) {
 		s.sendStatus(id, sshFxPermissionDenied, "access denied")
 		return
 	}
-	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, full, nil) }); err != nil {
+	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, full, nil, s.g.config.MaxUploadBytes) }); err != nil {
+		if errors.Is(err, errUploadTooLarge) {
+			s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+			return
+		}
 		s.sendFailure(id, err)
 		return
 	}
@@ -781,7 +796,11 @@ func (s *session) handleFsetstat(payload []byte) {
 		s.sendStatus(id, sshFxFailure, "invalid handle")
 		return
 	}
-	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, entry.path, entry.file) }); err != nil {
+	if err := fileops.Do(s.g.rootDir, func() error { return applyAttrs(attrs, entry.path, entry.file, s.g.config.MaxUploadBytes) }); err != nil {
+		if errors.Is(err, errUploadTooLarge) {
+			s.sendStatus(id, sshFxFailure, "upload exceeds maximum size")
+			return
+		}
 		s.sendFailure(id, err)
 		return
 	}
@@ -790,8 +809,11 @@ func (s *session) handleFsetstat(payload []byte) {
 
 // applyAttrs applies the supported attribute changes to a file, identified
 // either by an open *os.File (f, preferred when set) or by path.
-func applyAttrs(a fileAttrs, path string, f *os.File) error {
+func applyAttrs(a fileAttrs, path string, f *os.File, maxUploadBytes int64) error {
 	if a.hasSize {
+		if a.size > math.MaxInt64 || (maxUploadBytes > 0 && a.size > uint64(maxUploadBytes)) {
+			return errUploadTooLarge
+		}
 		if f != nil {
 			if err := f.Truncate(int64(a.size)); err != nil {
 				return err
@@ -868,6 +890,10 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 		s.sendStatus(id, sshFxPermissionDenied, "access denied")
 		return
 	}
+	if isRootPath(s.g.rootDir, oldFull) || isRootPath(s.g.rootDir, newFull) {
+		s.sendStatus(id, sshFxPermissionDenied, "cannot rename root directory")
+		return
+	}
 
 	if err := fileops.Rename(s.g.rootDir, oldFull, newFull); err != nil {
 		s.sendFailure(id, err)
@@ -876,6 +902,12 @@ func (s *session) handlePosixRename(id uint32, rest []byte) {
 
 	s.g.logger.Info("posix-renamed", "from", oldPath, "to", newPath)
 	s.sendStatus(id, sshFxOk, "")
+}
+
+func isRootPath(rootDir, fullPath string) bool {
+	absRoot, err1 := filepath.Abs(rootDir)
+	absPath, err2 := filepath.Abs(fullPath)
+	return err1 == nil && err2 == nil && absPath == absRoot
 }
 
 // sendStatus writes an SSH_FXP_STATUS response.
@@ -892,7 +924,7 @@ func (s *session) sendStatus(id uint32, code uint32, msg string) {
 	resp = marshalUint32(resp, code)
 	resp = marshalString(resp, msg)
 	resp = marshalString(resp, "") // language tag
-	writePacket(s.ch, sshFxpStatus, resp)
+	s.sendPacket(sshFxpStatus, resp)
 }
 
 // addHandle registers an open handle and returns its opaque id. It returns

@@ -1,28 +1,75 @@
 package gateway
 
-import "path/filepath"
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
-// evalDeepestAncestor returns filepath.EvalSymlinks of the deepest ancestor of
-// the clean absolute path p (p itself included) that EvalSymlinks can resolve,
-// joined with the components below that ancestor, which do not exist yet.
-//
-// Windows paths carry volume names and resolve by their own rules, which the
-// single walk in resolve.go does not model, so here EvalSymlinks is still asked
-// about one ancestor after another, from p up: quadratic in the path's length.
-func evalDeepestAncestor(p string) string {
-	cur, rest := p, ""
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			if rest != "" {
-				resolved = filepath.Join(resolved, rest)
+const maxSymlinks = 255
+
+// resolvePath walks the clean absolute Windows path p top-down from its volume
+// root, resolving every symlink component including dangling links.
+func resolvePath(p string) (string, error) {
+	vol := filepath.VolumeName(p)
+	dest := vol + `\`
+	restPath := strings.TrimLeft(strings.TrimPrefix(p, vol), `\/`)
+	links := 0
+	for path := filepath.ToSlash(restPath); path != ""; {
+		elem, rest, more := strings.Cut(path, "/")
+		path = rest
+		switch elem {
+		case "", ".":
+			continue
+		case "..":
+			if parent := filepath.Dir(dest); parent != dest {
+				dest = parent
 			}
-			return resolved
+			continue
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return p
+		next := filepath.Join(dest, elem)
+		info, err := os.Lstat(next)
+		if err != nil {
+			if more {
+				return filepath.Clean(filepath.Join(next, filepath.FromSlash(rest))), nil
+			}
+			return filepath.Clean(next), nil
 		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
+		if info.Mode()&fs.ModeSymlink == 0 {
+			dest = next
+			if !info.IsDir() && more {
+				return dest, nil
+			}
+			continue
+		}
+		links++
+		if links > maxSymlinks {
+			return "", fmt.Errorf("too many symlinks")
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) {
+			tVol := filepath.VolumeName(target)
+			if tVol == "" {
+				tVol = vol
+			}
+			vol = tVol
+			dest = vol + `\`
+			target = strings.TrimLeft(strings.TrimPrefix(target, tVol), `\/`)
+		}
+		target = filepath.ToSlash(target)
+		if more {
+			path = target + "/" + rest
+		} else {
+			path = target
+		}
 	}
+	if resolved, err := filepath.EvalSymlinks(dest); err == nil {
+		return resolved, nil
+	}
+	return dest, nil
 }

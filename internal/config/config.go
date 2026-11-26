@@ -3,7 +3,11 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -112,7 +116,9 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
@@ -286,6 +292,14 @@ func validate(cfg *Config) error {
 	if cfg.Gateways.SFTP.Enabled && cfg.Gateways.SFTP.HostKeyPath == "" {
 		return fmt.Errorf("sftp.host_key_path is required when SFTP gateway is enabled")
 	}
+	if err := checkListenAddrs([]listenSpec{
+		{"gateways.s3.listen_addr", cfg.Gateways.S3.ListenAddr, cfg.Gateways.S3.Enabled},
+		{"gateways.webdav.listen_addr", cfg.Gateways.WebDAV.ListenAddr, cfg.Gateways.WebDAV.Enabled},
+		{"gateways.http.listen_addr", cfg.Gateways.HTTP.ListenAddr, cfg.Gateways.HTTP.Enabled},
+		{"gateways.sftp.listen_addr", cfg.Gateways.SFTP.ListenAddr, cfg.Gateways.SFTP.Enabled},
+	}); err != nil {
+		return err
+	}
 	if err := checkCredentials(cfg); err != nil {
 		return err
 	}
@@ -298,9 +312,16 @@ func validate(cfg *Config) error {
 	if m.MinPartBytes < 0 || m.MaxPartBytes < 0 {
 		return fmt.Errorf("multipart part size limits must not be negative")
 	}
-	// A minimum above the maximum would reject every multi-part upload with a
-	// contradictory pair of errors, so refuse it at startup instead.
-	if m.MinPartBytes > 0 && m.MaxPartBytes > 0 && m.MinPartBytes > m.MaxPartBytes {
+	// A minimum above the maximum (including against the default for an unset
+	// bound) would reject every multi-part upload, so refuse it at startup.
+	minEff, maxEff := m.MinPartBytes, m.MaxPartBytes
+	if minEff == 0 {
+		minEff = 5 << 20
+	}
+	if maxEff == 0 {
+		maxEff = 5 << 30
+	}
+	if minEff > maxEff {
 		return fmt.Errorf("multipart.min_part_bytes must not exceed multipart.max_part_bytes")
 	}
 	if m.MaxParts < 0 {
@@ -343,14 +364,49 @@ func checkCredentials(cfg *Config) error {
 		if !p.enabled {
 			continue
 		}
+		aBlank := strings.TrimSpace(p.a) == ""
+		bBlank := strings.TrimSpace(p.b) == ""
 		switch {
-		case p.a == "" && p.b == "" && !p.anonymous:
+		case aBlank && bBlank && p.a == "" && p.b == "" && !p.anonymous:
 			return fmt.Errorf("%s is enabled without %s/%s; set both, or set %s.allow_anonymous: true to serve without authentication", p.gateway, p.first, p.second, p.gateway)
-		case (p.a == "") != (p.b == ""):
+		case aBlank && bBlank && (p.a != "" || p.b != ""):
+			return fmt.Errorf("%s %s/%s must not be whitespace", p.gateway, p.first, p.second)
+		case aBlank != bBlank:
 			return fmt.Errorf("%s needs both %s and %s; one alone lets anyone in with an empty value", p.gateway, p.first, p.second)
 		case isPlaceholder(p.a) || isPlaceholder(p.b):
 			return fmt.Errorf("%s credentials still contain an example placeholder (changeme); set real values", p.gateway)
 		}
+	}
+	return nil
+}
+
+type listenSpec struct {
+	name    string
+	addr    string
+	enabled bool
+}
+
+func checkListenAddrs(specs []listenSpec) error {
+	seen := make(map[string]string, len(specs))
+	for _, s := range specs {
+		if !s.enabled {
+			continue
+		}
+		if s.addr == "" {
+			return fmt.Errorf("%s is required", s.name)
+		}
+		host, port, err := net.SplitHostPort(s.addr)
+		if err != nil || port == "" {
+			return fmt.Errorf("%s %q must be host:port", s.name, s.addr)
+		}
+		if port == "0" {
+			continue
+		}
+		key := strings.ToLower(host) + ":" + port
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("%s %q conflicts with %s", s.name, s.addr, prev)
+		}
+		seen[key] = s.name
 	}
 	return nil
 }

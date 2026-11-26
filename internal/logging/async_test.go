@@ -153,3 +153,22 @@ func TestCloseIsIdempotent(t *testing.T) {
 	async.Close()
 	async.Close()
 }
+
+func TestCloseReturnsPromptlyOnStalledConsumer(t *testing.T) {
+	prev := closeTimeout
+	closeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { closeTimeout = prev })
+
+	stalled := &blockingHandler{release: make(chan struct{})}
+	defer close(stalled.release)
+
+	async := NewAsync(stalled)
+	logger := slog.New(async)
+	logger.Info("blocked")
+
+	start := time.Now()
+	async.Close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close blocked for %v behind a stalled consumer", elapsed)
+	}
+}

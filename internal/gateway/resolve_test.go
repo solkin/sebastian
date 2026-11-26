@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -101,9 +102,8 @@ func TestSafePath_SymlinksAtDepthAboveMissingTail(t *testing.T) {
 	}
 }
 
-// referenceResolve is resolveNoSymlinkEscape as it was before the single walk:
-// EvalSymlinks retried on each ancestor from the leaf up. It is quadratic in the
-// path's length but plainly what the resolver means, so it is the oracle below.
+// referenceResolve is an independent, quadratic oracle built on stdlib
+// filepath.EvalSymlinks that also follows dangling symlinks via Readlink.
 func referenceResolve(rootDir, full string) (resolvedPath, realRoot string, rootResolved bool, err error) {
 	absRoot, err := filepath.Abs(rootDir)
 	if err != nil {
@@ -117,23 +117,98 @@ func referenceResolve(rootDir, full string) (resolvedPath, realRoot string, root
 	if err != nil {
 		return absFull, absRoot, false, nil
 	}
-	cur, rest := absFull, ""
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			if rest != "" {
-				resolved = filepath.Join(resolved, rest)
-			}
+	cur := filepath.Clean(absFull)
+	for depth := 0; depth <= maxSymlinks; depth++ {
+		if resolved, rerr := filepath.EvalSymlinks(cur); rerr == nil {
 			if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
 				return "", realRoot, true, fmt.Errorf("path traversal")
 			}
 			return resolved, realRoot, true, nil
+		} else if strings.Contains(rerr.Error(), "too many links") {
+			return "", realRoot, true, fmt.Errorf("path traversal: too many symlinks")
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return absFull, realRoot, true, nil
+		// Find the deepest ancestor that EvalSymlinks can resolve cleanly.
+		probe, rest := cur, ""
+		for {
+			if resolved, rerr := filepath.EvalSymlinks(probe); rerr == nil {
+				info, serr := os.Lstat(resolved)
+				if serr == nil && !info.IsDir() && rest != "" {
+					if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+						return "", realRoot, true, fmt.Errorf("path traversal")
+					}
+					return resolved, realRoot, true, nil
+				}
+				if rest == "" {
+					if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+						return "", realRoot, true, fmt.Errorf("path traversal")
+					}
+					return resolved, realRoot, true, nil
+				}
+				head, tail, _ := strings.Cut(filepath.ToSlash(rest), "/")
+				cand := filepath.Join(resolved, head)
+				if li, lerr := os.Lstat(cand); lerr == nil && li.Mode()&fs.ModeSymlink != 0 {
+					target, rlErr := os.Readlink(cand)
+					if rlErr != nil {
+						return "", realRoot, true, fmt.Errorf("path traversal: %w", rlErr)
+					}
+					if !filepath.IsAbs(target) {
+						target = filepath.Join(resolved, target)
+					}
+					if tail != "" {
+						cur = filepath.Join(target, filepath.FromSlash(tail))
+					} else {
+						cur = target
+					}
+					break // restart from the symlink target
+				}
+				final := filepath.Clean(filepath.Join(resolved, rest))
+				if final != realRoot && !strings.HasPrefix(final, realRoot+string(filepath.Separator)) {
+					return "", realRoot, true, fmt.Errorf("path traversal")
+				}
+				return final, realRoot, true, nil
+			}
+			parent := filepath.Dir(probe)
+			if parent == probe {
+				if cur != realRoot && !strings.HasPrefix(cur, realRoot+string(filepath.Separator)) {
+					return "", realRoot, true, fmt.Errorf("path traversal")
+				}
+				return cur, realRoot, true, nil
+			}
+			if rest == "" {
+				rest = filepath.Base(probe)
+			} else {
+				rest = filepath.Join(filepath.Base(probe), rest)
+			}
+			probe = parent
 		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
+	}
+	return "", realRoot, true, fmt.Errorf("path traversal: too many symlinks")
+}
+
+func TestSafePath_RefusesDanglingAndLoopSymlinks(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	for name, target := range map[string]string{
+		"dango":        filepath.Join(outside, "missing"),
+		"dango_rel":    filepath.Join("..", filepath.Base(outside), "missing"),
+		"dang_res":     filepath.Join(root, ReservedDirName, "evil"),
+		"dang_scratch": filepath.Join(root, tempFilePrefix+"evil"),
+		"dang_escape":  "missing/../../outside",
+		"loop":         "loop",
+		"ping":         "pong",
+		"pong":         "ping",
+		"dang_in":      filepath.Join(root, "inside-missing"),
+	} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Skipf("symlinks unsupported: %v", err)
+		}
+	}
+	for _, bad := range []string{"dango", "dango/sub", "dango_rel", "dang_res", "dang_scratch", "dang_escape", "loop", "ping"} {
+		if _, _, err := SafePath(root, bad); err == nil {
+			t.Errorf("SafePath(%q) succeeded, want error", bad)
+		}
+	}
+	if _, _, err := SafePath(root, "dang_in"); err != nil {
+		t.Errorf("SafePath(dang_in) failed: %v", err)
 	}
 }
 

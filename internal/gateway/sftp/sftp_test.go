@@ -1320,7 +1320,7 @@ func TestApplyAttrsPathAndFile(t *testing.T) {
 		atime:    123,
 		mtime:    456,
 	}
-	if err := applyAttrs(pathAttrs, p, nil); err != nil {
+	if err := applyAttrs(pathAttrs, p, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(p)
@@ -1343,7 +1343,7 @@ func TestApplyAttrsPathAndFile(t *testing.T) {
 		hasPerm: true,
 		perm:    0o640,
 	}
-	if err := applyAttrs(openFileAttrs, p, f); err != nil {
+	if err := applyAttrs(openFileAttrs, p, f, 0); err != nil {
 		t.Fatal(err)
 	}
 	info, err = os.Stat(p)

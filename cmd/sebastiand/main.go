@@ -43,46 +43,40 @@ func main() {
 		fmt.Println("sebastiand", version)
 		return
 	}
+	if err := run(*configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(configPath string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 
 	logs := logging.NewAsync(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	defer logs.Close()
 	logger := slog.New(logs)
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		logger.Error("failed to load config", "error", err)
-		logs.Close()
-		os.Exit(1)
-	}
-
 	if err := os.MkdirAll(cfg.RootDir, 0o755); err != nil {
-		logger.Error("failed to create root_dir", "path", cfg.RootDir, "error", err)
-		logs.Close()
-		os.Exit(1)
+		return fmt.Errorf("create root_dir %s: %w", cfg.RootDir, err)
 	}
 
 	private := filepath.Join(cfg.RootDir, ".sebastian")
-	if info, err := os.Lstat(private); err == nil && !info.IsDir() {
-		logger.Error("private state must be a real directory", "path", private)
-		logs.Close()
-		os.Exit(1)
+	if info, err := os.Lstat(private); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("private state directory must be a real directory: %s", private)
 	}
-	if err := os.MkdirAll(private, 0700); err != nil {
-		logger.Error("create private state", "error", err)
-		logs.Close()
-		os.Exit(1)
+	if err := os.MkdirAll(private, 0o700); err != nil {
+		return fmt.Errorf("create private state: %w", err)
 	}
 	releaseVolume, err := fileops.AcquireLease(private)
 	if err != nil {
-		logger.Error("acquire volume lease", "error", err)
-		logs.Close()
-		os.Exit(1)
+		return fmt.Errorf("acquire volume lease: %w", err)
 	}
 	defer releaseVolume()
 	if err := fileops.Do(cfg.RootDir, func() error { return fileops.CheckOrphanedBackups(cfg.RootDir, nil) }); err != nil {
-		logger.Error("recover filesystem replacements", "error", err)
-		logs.Close()
-		os.Exit(1)
+		return fmt.Errorf("recover filesystem replacements: %w", err)
 	}
 
 	// Clear scratch files left by a previous crash before serving any requests.
@@ -108,11 +102,6 @@ func main() {
 	defer cancel()
 
 	var gateways []gateway.Gateway
-	errCh := make(chan error, 4)
-
-	// The multipart staging store is only reachable through the S3 API, but its
-	// janitor also sweeps scratch files written by the other gateways, so it runs
-	// whenever S3 is enabled.
 	var mpStore *multipart.Store
 	if cfg.Gateways.S3.Enabled {
 		store, err := multipart.New(cfg.RootDir, multipart.Limits{
@@ -127,9 +116,7 @@ func main() {
 			TempFileMaxAge:     cfg.Multipart.TempFileMaxAge,
 		}, logger)
 		if err != nil {
-			logger.Error("failed to initialize multipart store", "error", err)
-			logs.Close()
-			os.Exit(1)
+			return fmt.Errorf("initialize multipart store: %w", err)
 		}
 		mpStore = store
 
@@ -142,9 +129,7 @@ func main() {
 			Multipart:      mpStore,
 		}, logger)
 		if err := gw.CreateBuckets(cfg.Gateways.S3.Buckets); err != nil {
-			logger.Error("failed to create buckets", "error", err)
-			logs.Close()
-			os.Exit(1)
+			return fmt.Errorf("create buckets: %w", err)
 		}
 		gateways = append(gateways, gw)
 	}
@@ -178,42 +163,66 @@ func main() {
 			MaxUploadBytes: cfg.MaxUploadBytes,
 		}, logger)
 		if err != nil {
-			logger.Error("failed to create SFTP gateway", "error", err)
-			logs.Close()
-			os.Exit(1)
+			return fmt.Errorf("create SFTP gateway: %w", err)
 		}
 		gateways = append(gateways, gw)
 	}
 
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+
 	if mpStore != nil {
-		go multipart.NewJanitor(mpStore, logger).Run(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			multipart.NewJanitor(mpStore, logger).Run(ctx)
+		}()
+	} else {
+		interval := cfg.Multipart.CleanupInterval
+		if interval <= 0 {
+			interval = multipart.DefaultCleanupInterval
+		}
+		maxAge := cfg.Multipart.TempFileMaxAge
+		if maxAge <= 0 {
+			maxAge = multipart.DefaultTempFileMaxAge
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runTempFileJanitor(ctx, cfg.RootDir, interval, maxAge, logger)
+		}()
 	}
 
 	for _, gw := range gateways {
-		gw := gw
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			if err := gw.Start(ctx); err != nil {
-				errCh <- fmt.Errorf("%s: %w", gw.Name(), err)
+				err = fmt.Errorf("%s: %w", gw.Name(), err)
+				logger.Error("gateway error, shutting down", "error", err)
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
 			}
 		}()
 	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
-	var failure error
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", "signal", sig)
-	case failure = <-errCh:
-		logger.Error("gateway error, shutting down", "error", failure)
+	case <-ctx.Done():
 	}
 
 	cancel()
 
-	// Every gateway drains at once within one budget. One after another they
-	// could each wait out the whole budget, past the point where the container
-	// runtime kills the process.
+	// Every gateway drains at once within one budget. When the drain expires,
+	// Stop forcibly closes lingering transfers so shutdown ends cleanly.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownDrain)
 	defer shutdownCancel()
 	var stopping sync.WaitGroup
@@ -232,11 +241,38 @@ func main() {
 	}
 	stopping.Wait()
 
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		logger.Warn("background components did not stop within grace period")
+	}
+
 	logger.Info("sebastian stopped")
-	if failure != nil {
-		// A port that could not be bound, or a gateway that failed, must not
-		// look like an orderly stop to a supervisor reading the exit status.
-		logs.Close()
-		os.Exit(1)
+	if dropped := logs.Dropped(); dropped > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d log records were dropped; the log consumer could not keep up\n", dropped)
+	}
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func runTempFileJanitor(ctx context.Context, rootDir string, interval, maxAge time.Duration, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			gateway.SweepTempFiles(rootDir, maxAge, logger)
+		}
 	}
 }

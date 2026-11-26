@@ -27,6 +27,9 @@ const (
 	// maxSFTPConnections bounds concurrently served connections so a flood of TCP
 	// connections cannot spawn unbounded goroutines and SSH state.
 	maxSFTPConnections = 256
+	// maxSessionsPerConn bounds concurrent SSH session channels on a single
+	// authenticated connection so one client cannot exhaust file descriptors.
+	maxSessionsPerConn = 16
 	// sftpHandshakeTimeout bounds the SSH handshake so a client cannot hold a
 	// connection open indefinitely before authenticating.
 	sftpHandshakeTimeout = 30 * time.Second
@@ -51,9 +54,12 @@ type Gateway struct {
 	rootDir   string
 	config    Config
 	logger    *slog.Logger
+	mu        sync.Mutex
 	listener  net.Listener
+	conns     map[net.Conn]struct{}
 	sshConfig *ssh.ServerConfig
 	wg        sync.WaitGroup
+	stopOnce  sync.Once
 	closed    chan struct{}
 	connSem   chan struct{}
 }
@@ -64,6 +70,7 @@ func New(rootDir string, cfg Config, logger *slog.Logger) (*Gateway, error) {
 		rootDir: rootDir,
 		config:  cfg,
 		logger:  logger.With("gateway", "sftp"),
+		conns:   make(map[net.Conn]struct{}),
 		closed:  make(chan struct{}),
 		connSem: make(chan struct{}, maxSFTPConnections),
 	}
@@ -126,12 +133,26 @@ func (g *Gateway) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sftp listen: %w", err)
 	}
-	g.listener = ln
+	g.mu.Lock()
+	select {
+	case <-g.closed:
+		g.mu.Unlock()
+		ln.Close()
+		return nil
+	default:
+		g.listener = ln
+	}
+	g.mu.Unlock()
 	g.logger.Info("sftp gateway started", "addr", ln.Addr().String())
 
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		ln.Close()
+		select {
+		case <-ctx.Done():
+			ln.Close()
+		case <-done:
+		}
 	}()
 
 	for {
@@ -159,29 +180,49 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 }
 
-// Stop gracefully shuts down the SFTP gateway.
+// Stop gracefully shuts down the SFTP gateway. Active connections are given
+// until ctx expires to finish, then forcibly closed.
 func (g *Gateway) Stop(ctx context.Context) error {
-	close(g.closed)
-	if g.listener != nil {
-		g.listener.Close()
+	g.stopOnce.Do(func() { close(g.closed) })
+	g.mu.Lock()
+	ln := g.listener
+	g.mu.Unlock()
+	if ln != nil {
+		ln.Close()
 	}
 	done := make(chan struct{})
 	go func() {
 		g.wg.Wait()
 		close(done)
 	}()
+	var stopErr error
 	select {
 	case <-done:
 	case <-ctx.Done():
+		stopErr = ctx.Err()
+		g.mu.Lock()
+		for conn := range g.conns {
+			conn.Close()
+		}
+		g.mu.Unlock()
+		<-done
 	}
 	g.logger.Info("sftp gateway stopped")
-	return nil
+	return stopErr
 }
 
 func (g *Gateway) handleConnection(conn net.Conn) {
 	defer g.wg.Done()
 	defer func() { <-g.connSem }()
-	defer conn.Close()
+	g.mu.Lock()
+	g.conns[conn] = struct{}{}
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		delete(g.conns, conn)
+		g.mu.Unlock()
+		conn.Close()
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			g.logger.Error("sftp connection panic recovered", "remote", conn.RemoteAddr(), "panic", r)
@@ -189,7 +230,8 @@ func (g *Gateway) handleConnection(conn net.Conn) {
 	}()
 
 	// Bound the handshake so an unauthenticated client cannot hold the connection
-	// open; cleared once the SFTP loop installs its own per-packet idle deadline.
+	// open; once authenticated, keep an idle deadline even before any subsystem
+	// channel is opened.
 	conn.SetDeadline(time.Now().Add(sftpHandshakeTimeout))
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, g.sshConfig)
@@ -198,25 +240,38 @@ func (g *Gateway) handleConnection(conn net.Conn) {
 		return
 	}
 	defer sshConn.Close()
-	conn.SetDeadline(time.Time{})
+	conn.SetDeadline(time.Now().Add(sftpIdleTimeout))
 
 	g.logger.Info("ssh connection", "remote", sshConn.RemoteAddr(), "user", sshConn.User())
 
 	go ssh.DiscardRequests(reqs)
 
+	sessionSem := make(chan struct{}, maxSessionsPerConn)
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {
 			newCh.Reject(ssh.UnknownChannelType, "unsupported channel type")
 			continue
 		}
+		select {
+		case sessionSem <- struct{}{}:
+		default:
+			newCh.Reject(ssh.ResourceShortage, "too many sessions")
+			continue
+		}
 
 		ch, requests, err := newCh.Accept()
 		if err != nil {
+			<-sessionSem
 			g.logger.Error("channel accept failed", "error", err)
 			continue
 		}
 
-		go g.handleSession(conn, ch, requests)
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			defer func() { <-sessionSem }()
+			g.handleSession(conn, ch, requests)
+		}()
 	}
 }
 
