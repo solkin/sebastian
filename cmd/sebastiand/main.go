@@ -27,7 +27,7 @@ import (
 )
 
 // version is the release this binary was built from.
-var version = "1.7.0"
+var version = "1.8.0"
 
 // shutdownDrain is how long open transfers may finish after a stop signal.
 // It stays below Docker's default 10 s grace period, so a stop with a slow
