@@ -3,7 +3,7 @@ services:
     # Image published by the GH Actions "Docker" workflow (Docker Hub). Pin a
     # release; override via SEBASTIAN_IMAGE in .env. ":latest" moves on every
     # release.
-    image: ${SEBASTIAN_IMAGE:-solkin/sebastian:1.8.0}
+    image: ${SEBASTIAN_IMAGE:-solkin/sebastian:1.8.1}
     container_name: sebastian
     restart: unless-stopped
     # After SIGTERM open transfers get 8 s to finish. Docker's default 10 s

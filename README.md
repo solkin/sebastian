@@ -18,7 +18,7 @@ A simple, reliable single-node file server that projects S3, WebDAV, SFTP, and H
 
 ## Quick Start
 
-Current release: **v1.8.0**. Read the [release and upgrade notes](docs/releases/v1.8.0.md)
+Current release: **v1.8.1**. Read the [release and upgrade notes](docs/releases/v1.8.1.md)
 before upgrading an existing server. Coming from v1.6.x, read the
 [v1.7.0 upgrade notes](docs/releases/v1.7.0.md) as well: v1.7.0 refuses
 configurations that earlier releases accepted with only a warning.
@@ -31,7 +31,7 @@ docker run -d \
   -v /path/to/files:/data/files \
   -e SEBASTIAN_S3_ACCESS_KEY=choose-a-key -e SEBASTIAN_S3_SECRET_KEY=choose-a-secret \
   -e SEBASTIAN_HTTP_USERNAME=admin -e SEBASTIAN_HTTP_PASSWORD=choose-a-password \
-  solkin/sebastian:1.8.0
+  solkin/sebastian:1.8.1
 ```
 
 Open http://localhost:9400 for the web UI. Use any S3 client against http://localhost:9200.
